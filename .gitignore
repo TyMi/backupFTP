@@ -1,0 +1,15 @@
+# Old Bash original, not published
+/backupFTP
+
+# Real config may contain credentials - only commit backupFTP.conf.example
+backupFTP.conf
+
+# Internal notes with production server/customer data, not for the repo
+CLAUDE.md
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs
+*.log

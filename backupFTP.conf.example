@@ -1,0 +1,50 @@
+; backupFTP configuration file
+;
+; Copy to backupFTP.conf (or pass a path via --config) and adjust.
+; WARNING: If passwords are entered directly here (instead of via
+; password_env), be sure to restrict file permissions: chmod 600 backupFTP.conf
+;
+; [global] holds the default values for all backup jobs. Any value can be
+; overridden per job section.
+
+[global]
+base_dir = /data/bak
+keep = 7
+admin_mail = admin@example.com
+smtp_host = localhost
+smtp_port = 25
+; SMTP login, if the mail server requires authentication (e.g. many
+; hosting providers on port 465/587). Without smtp_user, sending is
+; attempted without login (e.g. a local relay MTA on port 25).
+smtp_user = mailer@example.com
+; Recommended: pass the password via environment variable, see below.
+smtp_password_env = SMTP_PASSWORD
+; Alternative (less secure, only used if smtp_password_env is not set):
+; smtp_password = secret
+; If neither smtp_password_env nor smtp_password is set but smtp_user is
+; present, the password is requested interactively via getpass().
+
+; One job per section. The section name (here "example1") is used as the
+; directory name under base_dir (only a-z, 0-9, - and _) and serves as the
+; unique job ID (e.g. for --job).
+;
+; name = human-readable name, used in the log, mail subject and mail body.
+
+[example1]
+name = Example Website 1
+sourceserver = ftp.example1.com
+ftpuser = user1
+; Recommended: pass the password via environment variable, see below.
+password_env = FTP_PASSWORD_EXAMPLE1
+; Alternative (less secure, only used if password_env is not set):
+; password = secret
+; If neither password_env nor password is set, the password is requested
+; interactively via getpass().
+
+[example2]
+name = Example Website 2
+sourceserver = ftp.example2.com
+ftpuser = user2
+password_env = FTP_PASSWORD_EXAMPLE2
+; Example of overriding a global default for just this job:
+; keep = 14
