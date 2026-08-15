@@ -59,6 +59,14 @@ plain web space content. Only the last `keep` generations (default: 7),
 including their log, are kept automatically; older ones are removed on
 every successful run.
 
+## Email notifications
+
+By default, every run sends an email: on success a short "SUCCEEDED"
+notice, on failure the collected log plus the error. To only be notified
+about failures, set `notify_on_success = false` in `[global]` and/or in a
+specific job section (job setting overrides the global default). Failure
+emails are always sent regardless of this setting.
+
 ## Automated operation (cron.daily)
 
 A ready-made wrapper template is included as `backupFTP-cron-daily.sh`

@@ -34,6 +34,7 @@ DEFAULT_SMTP_PORT = 25
 DEFAULT_KEEP_GENERATIONS = 7
 
 VALID_JOB_KEY = re.compile(r"^[a-zA-Z0-9_-]+$")
+DEFAULT_NOTIFY_ON_SUCCESS = True
 
 
 class BackupError(Exception):
@@ -80,6 +81,7 @@ class JobConfig:
     smtp_user: str | None
     smtp_password: str | None
     smtp_password_env: str | None
+    notify_on_success: bool
 
 
 def parse_args() -> argparse.Namespace:
@@ -109,6 +111,12 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _parse_bool(value: str | None, default: bool) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
 def load_config(config_path: Path) -> list[JobConfig]:
     if not config_path.is_file():
         raise ConfigError(f"Config file not found: {config_path}")
@@ -125,6 +133,9 @@ def load_config(config_path: Path) -> list[JobConfig]:
     global_smtp_user = global_section.get("smtp_user")
     global_smtp_password = global_section.get("smtp_password")
     global_smtp_password_env = global_section.get("smtp_password_env")
+    global_notify_on_success = _parse_bool(
+        global_section.get("notify_on_success"), DEFAULT_NOTIFY_ON_SUCCESS
+    )
 
     jobs: list[JobConfig] = []
     for section_name in parser.sections():
@@ -161,6 +172,9 @@ def load_config(config_path: Path) -> list[JobConfig]:
                 smtp_user=section.get("smtp_user", global_smtp_user),
                 smtp_password=section.get("smtp_password", global_smtp_password),
                 smtp_password_env=section.get("smtp_password_env", global_smtp_password_env),
+                notify_on_success=_parse_bool(
+                    section.get("notify_on_success"), global_notify_on_success
+                ),
             )
         )
 
@@ -384,15 +398,18 @@ def run_job(job: JobConfig) -> bool:
         rotate_backups(job_base_dir, job.keep, logger)
 
         logger.info("Backup for '%s' completed successfully", job.name)
-        send_mail(
-            job.smtp_host,
-            job.smtp_port,
-            job.smtp_user,
-            smtp_password,
-            job.admin_mail,
-            f"backupFTP for '{job.name}' ({job.sourceserver}) --> {final_dir} SUCCEEDED",
-            "OK",
-        )
+        if job.notify_on_success:
+            send_mail(
+                job.smtp_host,
+                job.smtp_port,
+                job.smtp_user,
+                smtp_password,
+                job.admin_mail,
+                f"backupFTP for '{job.name}' ({job.sourceserver}) --> {final_dir} SUCCEEDED",
+                "OK",
+            )
+        else:
+            logger.info("Success notification suppressed (notify_on_success = false)")
         return True
 
     except BackupError as exc:
