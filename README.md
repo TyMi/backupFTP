@@ -1,5 +1,7 @@
 # backupFTP
 
+![Built with AI](https://img.shields.io/badge/Built_with-AI-success)
+
 Python tool for backing up multiple web spaces via FTP(S). Mirrors each
 configured FTP server recursively into a local directory, keeps the last
 N generations and sends an email notification about the success or
