@@ -33,6 +33,10 @@ smtp_password_env = SMTP_PASSWORD
 ; Whether to send a notification email on a SUCCESSFUL backup run.
 ; Failure emails are always sent regardless of this setting.
 notify_on_success = true
+; Comma-separated glob patterns (fnmatch), matched against each entry's
+; path relative to the job root, to skip entirely (files AND, for a
+; matching directory itself, its whole subtree - no round-trip into it):
+; exclude = cache/*, *.log, wp-content/uploads/cache/*
 
 ; One job per section. The section name (here "example1") is used as the
 ; directory name under base_dir (only a-z, 0-9, - and _) and serves as the

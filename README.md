@@ -90,6 +90,22 @@ below). Populate the known-hosts entry once beforehand, e.g. with
 `ssh-keyscan -p <sftp_port> <sourceserver> >> known_hosts_file`
 (verify the printed fingerprint out-of-band before trusting it).
 
+## Excluding files
+
+Set `exclude` (global and/or per job) to a comma-separated list of glob
+patterns (`fnmatch` syntax), matched against each entry's path relative
+to the job root - works the same for FTP(S) and SFTP jobs:
+
+```ini
+exclude = cache/*, *.log, wp-content/uploads/cache/*
+```
+
+A pattern that matches a directory itself (like `cache/*` matching
+everything under `cache`) skips that whole subtree without descending
+into it at all - not just its files one by one. `--dry-run` respects
+`exclude` too, so its size estimate matches what an actual run would
+transfer.
+
 ## Email notifications
 
 By default, every run sends an email: on success a short "SUCCEEDED"
@@ -163,6 +179,11 @@ timezone should be set correctly (`timedatectl status`).
 - A single unreadable/failing file no longer aborts the whole job: it is
   skipped and listed in the notification mail, and the run is reported
   as a partial success (`SUCCEEDED (Teilerfolg: ...)`).
+- Each downloaded file's size is compared against the size the server
+  reported while listing it; a mismatch (e.g. a transfer that ended
+  early without the client noticing) is treated like any other failed
+  file - skipped, removed locally and reported as a partial success,
+  rather than silently kept as a truncated backup.
 
 ## Known limitations / not currently planned
 

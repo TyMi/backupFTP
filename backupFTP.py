@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import fnmatch
 import ftplib
 import getpass
 import logging
@@ -90,6 +91,7 @@ class JobConfig:
     sftp_port: int
     ssh_key_file: str | None
     known_hosts_file: str | None
+    exclude: list[str]
     base_dir: Path
     keep: int
     admin_mail: str
@@ -158,6 +160,29 @@ def _validate_protocol(section_name: str, value: str) -> str:
     return value
 
 
+def _parse_exclude(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [pattern.strip() for pattern in value.split(",") if pattern.strip()]
+
+
+def _is_excluded(rel_path: str, exclude: list[str], is_dir: bool) -> bool:
+    """Whether rel_path (job-relative, no leading slash) matches an exclude pattern.
+
+    For a directory, also treats it as excluded (skipping the whole subtree,
+    without descending into it) if a pattern would match anything inside it
+    - e.g. "cache/*" excludes the whole "cache" directory, not just its
+    files one by one.
+    """
+    if any(fnmatch.fnmatch(rel_path, pattern) for pattern in exclude):
+        return True
+    if is_dir:
+        probe = rel_path + "/\x00probe\x00"
+        if any(fnmatch.fnmatch(probe, pattern) for pattern in exclude):
+            return True
+    return False
+
+
 def _validate_keep(section_name: str, value: int) -> int:
     if value < 1:
         raise ConfigError(
@@ -205,6 +230,7 @@ def load_config(config_path: Path) -> list[JobConfig]:
     global_sftp_port = int(global_section.get("sftp_port", DEFAULT_SFTP_PORT))
     global_ssh_key_file = global_section.get("ssh_key_file")
     global_known_hosts_file = global_section.get("known_hosts_file")
+    global_exclude_raw = global_section.get("exclude")
 
     jobs: list[JobConfig] = []
     for section_name in parser.sections():
@@ -239,6 +265,7 @@ def load_config(config_path: Path) -> list[JobConfig]:
                 sftp_port=int(section.get("sftp_port", global_sftp_port)),
                 ssh_key_file=section.get("ssh_key_file", global_ssh_key_file),
                 known_hosts_file=section.get("known_hosts_file", global_known_hosts_file),
+                exclude=_parse_exclude(section.get("exclude", global_exclude_raw)),
                 base_dir=Path(section.get("base_dir", str(global_base_dir))),
                 keep=_validate_keep(section_name, int(section.get("keep", global_keep))),
                 admin_mail=section.get("admin_mail", global_admin_mail),
@@ -410,6 +437,7 @@ def mirror_ftp(
     local_dir: Path,
     logger: logging.Logger,
     skipped: list[str],
+    exclude: list[str],
 ) -> None:
     local_dir.mkdir(parents=True, exist_ok=True)
     local_dir_resolved = local_dir.resolve()
@@ -437,19 +465,32 @@ def mirror_ftp(
 
         entry_type = facts.get("type", "file")
         remote_path = f"{remote_dir}/{name}" if remote_dir != "/" else f"/{name}"
+        rel_path = remote_path.lstrip("/")
+        if _is_excluded(rel_path, exclude, entry_type == "dir"):
+            logger.info("Excluded by pattern: %s", remote_path)
+            continue
+
         local_path = (local_dir / name).resolve()
         if not local_path.is_relative_to(local_dir_resolved):
             raise DownloadError(f"Path traversal attempt via server filename: {name!r}")
 
         if entry_type == "dir":
             logger.debug("Directory: %s", remote_path)
-            mirror_ftp(ftp, remote_path, local_path, logger, skipped)
+            mirror_ftp(ftp, remote_path, local_path, logger, skipped, exclude)
             ftp.cwd(remote_dir)
         elif entry_type == "file":
             logger.debug("File: %s", remote_path)
             try:
                 with open(local_path, "wb") as fh:
                     ftp.retrbinary(f"RETR {name}", fh.write)
+                expected_size = facts.get("size")
+                if expected_size is not None:
+                    actual_size = local_path.stat().st_size
+                    if actual_size != int(expected_size):
+                        raise OSError(
+                            f"size mismatch after download: expected {expected_size} bytes, "
+                            f"got {actual_size}"
+                        )
             except (*ftplib.all_errors, OSError) as exc:
                 logger.warning("Skipping unreadable file %s: %s", remote_path, exc)
                 skipped.append(f"{remote_path}: {exc}")
@@ -467,6 +508,7 @@ def mirror_sftp(
     local_dir: Path,
     logger: logging.Logger,
     skipped: list[str],
+    exclude: list[str],
 ) -> None:
     local_dir.mkdir(parents=True, exist_ok=True)
     local_dir_resolved = local_dir.resolve()
@@ -485,18 +527,31 @@ def mirror_sftp(
             continue
 
         remote_path = f"{remote_dir}/{name}" if remote_dir != "/" else f"/{name}"
+        rel_path = remote_path.lstrip("/")
+        mode = attr.st_mode or 0
+        if _is_excluded(rel_path, exclude, stat.S_ISDIR(mode)):
+            logger.info("Excluded by pattern: %s", remote_path)
+            continue
+
         local_path = (local_dir / name).resolve()
         if not local_path.is_relative_to(local_dir_resolved):
             raise DownloadError(f"Path traversal attempt via server filename: {name!r}")
 
-        mode = attr.st_mode or 0
         if stat.S_ISDIR(mode):
             logger.debug("Directory: %s", remote_path)
-            mirror_sftp(sftp, remote_path, local_path, logger, skipped)
+            mirror_sftp(sftp, remote_path, local_path, logger, skipped, exclude)
         elif stat.S_ISREG(mode):
             logger.debug("File: %s", remote_path)
             try:
                 sftp.get(remote_path, str(local_path))
+                expected_size = attr.st_size
+                if expected_size is not None:
+                    actual_size = local_path.stat().st_size
+                    if actual_size != expected_size:
+                        raise OSError(
+                            f"size mismatch after download: expected {expected_size} bytes, "
+                            f"got {actual_size}"
+                        )
             except (OSError, paramiko.SSHException) as exc:
                 logger.warning("Skipping unreadable file %s: %s", remote_path, exc)
                 skipped.append(f"{remote_path}: {exc}")
@@ -508,7 +563,9 @@ def mirror_sftp(
             logger.debug("Skipping entry of type (mode=%o): %s", mode, remote_path)
 
 
-def dry_run_listing(ftp: ftplib.FTP, remote_dir: str, logger: logging.Logger) -> tuple[int, int, int]:
+def dry_run_listing(
+    ftp: ftplib.FTP, remote_dir: str, logger: logging.Logger, exclude: list[str]
+) -> tuple[int, int, int]:
     """Recursively lists the server like mirror_ftp, but writes nothing locally.
 
     Returns (file_count, dir_count, total_bytes).
@@ -539,10 +596,13 @@ def dry_run_listing(ftp: ftplib.FTP, remote_dir: str, logger: logging.Logger) ->
 
         entry_type = facts.get("type", "file")
         remote_path = f"{remote_dir}/{name}" if remote_dir != "/" else f"/{name}"
+        rel_path = remote_path.lstrip("/")
+        if _is_excluded(rel_path, exclude, entry_type == "dir"):
+            continue
 
         if entry_type == "dir":
             dir_count += 1
-            sub_files, sub_dirs, sub_bytes = dry_run_listing(ftp, remote_path, logger)
+            sub_files, sub_dirs, sub_bytes = dry_run_listing(ftp, remote_path, logger, exclude)
             file_count += sub_files
             dir_count += sub_dirs
             total_bytes += sub_bytes
@@ -558,7 +618,7 @@ def dry_run_listing(ftp: ftplib.FTP, remote_dir: str, logger: logging.Logger) ->
 
 
 def dry_run_listing_sftp(
-    sftp: "paramiko.SFTPClient", remote_dir: str, logger: logging.Logger
+    sftp: "paramiko.SFTPClient", remote_dir: str, logger: logging.Logger, exclude: list[str]
 ) -> tuple[int, int, int]:
     """Same as dry_run_listing(), but over an already-connected SFTP client."""
     try:
@@ -578,11 +638,14 @@ def dry_run_listing_sftp(
             continue
 
         remote_path = f"{remote_dir}/{name}" if remote_dir != "/" else f"/{name}"
+        rel_path = remote_path.lstrip("/")
         mode = attr.st_mode or 0
+        if _is_excluded(rel_path, exclude, stat.S_ISDIR(mode)):
+            continue
 
         if stat.S_ISDIR(mode):
             dir_count += 1
-            sub_files, sub_dirs, sub_bytes = dry_run_listing_sftp(sftp, remote_path, logger)
+            sub_files, sub_dirs, sub_bytes = dry_run_listing_sftp(sftp, remote_path, logger, exclude)
             file_count += sub_files
             dir_count += sub_dirs
             total_bytes += sub_bytes
@@ -685,7 +748,7 @@ def _connect_and_mirror(
             logger,
         )
         try:
-            mirror_sftp(sftp, "/", tmp_dir, logger, skipped)
+            mirror_sftp(sftp, "/", tmp_dir, logger, skipped, job.exclude)
         finally:
             sftp.close()
             ssh_client.close()
@@ -695,7 +758,7 @@ def _connect_and_mirror(
         job.sourceserver, job.ftpuser, ftppasswd, job.tls, job.tls_ca_file, logger
     )
     try:
-        mirror_ftp(ftp, "/", tmp_dir, logger, skipped)
+        mirror_ftp(ftp, "/", tmp_dir, logger, skipped, job.exclude)
     finally:
         try:
             ftp.quit()
@@ -826,7 +889,9 @@ def run_job_dry_run(job: JobConfig) -> bool:
                 logger,
             )
             try:
-                file_count, dir_count, total_bytes = dry_run_listing_sftp(sftp, "/", logger)
+                file_count, dir_count, total_bytes = dry_run_listing_sftp(
+                    sftp, "/", logger, job.exclude
+                )
             finally:
                 sftp.close()
                 ssh_client.close()
@@ -836,7 +901,7 @@ def run_job_dry_run(job: JobConfig) -> bool:
                 job.sourceserver, job.ftpuser, ftppasswd, job.tls, job.tls_ca_file, logger
             )
             try:
-                file_count, dir_count, total_bytes = dry_run_listing(ftp, "/", logger)
+                file_count, dir_count, total_bytes = dry_run_listing(ftp, "/", logger, job.exclude)
             finally:
                 try:
                     ftp.quit()
