@@ -1065,17 +1065,17 @@ def main() -> int:
         print(f"Config error: {exc}", file=sys.stderr)
         return 1
 
-    if args.list_jobs:
-        for job in jobs:
-            print(f"{job.key}\t{job.name}\t{job.sourceserver}")
-        return 0
-
     if args.jobs:
         unknown = set(args.jobs) - {job.key for job in jobs}
         if unknown:
             print(f"Unknown job keys: {', '.join(sorted(unknown))}", file=sys.stderr)
             return 1
         jobs = [job for job in jobs if job.key in args.jobs]
+
+    if args.list_jobs:
+        for job in jobs:
+            print(f"{job.key}\t{job.name}\t{job.sourceserver}")
+        return 0
 
     if args.dry_run:
         results = [run_job_dry_run(job) for job in jobs]
