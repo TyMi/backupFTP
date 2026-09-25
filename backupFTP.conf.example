@@ -10,6 +10,18 @@
 [global]
 base_dir = /data/bak
 keep = 7
+; Optional: GFS-style retention (grandfather-father-son) instead of the
+; flat "keep" above. If any of keep_daily/keep_weekly/keep_monthly is
+; set (> 0), "keep" is ignored entirely for that job/global scope and
+; GFS retention is used: the most recent keep_daily generations are
+; kept outright, plus the latest generation of each of the last
+; keep_weekly ISO weeks and each of the last keep_monthly calendar
+; months (a generation covered by more than one rule is only kept
+; once). Leave all three unset/0 (default) to keep the flat "keep"
+; behavior unchanged.
+; keep_daily = 7
+; keep_weekly = 4
+; keep_monthly = 6
 ; tls = required (default): FTPS with certificate verification, abort if
 ;   unavailable. "preferred": try FTPS, fall back to plain FTP if the
 ;   server does not support it (logged as a warning, marked as insecure

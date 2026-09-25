@@ -68,6 +68,27 @@ plain web space content. Only the last `keep` generations (default: 7),
 including their log, are kept automatically; older ones are removed on
 every successful run.
 
+## Retention (flat count or GFS)
+
+By default, `keep` retains a flat number of the most recent generations
+(as above). For longer history at the same storage cost, set one or more
+of `keep_daily`, `keep_weekly`, `keep_monthly` (global and/or per job)
+instead:
+
+```ini
+keep_daily = 7
+keep_weekly = 4
+keep_monthly = 6
+```
+
+This switches that job to grandfather-father-son (GFS) retention: the
+most recent `keep_daily` generations are kept outright, plus the latest
+generation of each of the last `keep_weekly` ISO weeks and each of the
+last `keep_monthly` calendar months (a generation matched by more than
+one rule still only counts once). `keep` is ignored once any of these
+three is set. Leaving all three at their default of `0` keeps the
+existing flat `keep` behavior unchanged.
+
 ## SFTP jobs
 
 Set `protocol = sftp` on a job (default: `ftp`) to use SFTP instead of

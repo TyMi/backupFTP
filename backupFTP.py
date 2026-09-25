@@ -94,6 +94,9 @@ class JobConfig:
     exclude: list[str]
     base_dir: Path
     keep: int
+    keep_daily: int
+    keep_weekly: int
+    keep_monthly: int
     admin_mail: str
     smtp_host: str
     smtp_port: int
@@ -192,6 +195,12 @@ def _validate_keep(section_name: str, value: int) -> int:
     return value
 
 
+def _validate_gfs_keep(section_name: str, option_name: str, value: int) -> int:
+    if value < 0:
+        raise ConfigError(f"Job '{section_name}': invalid {option_name}={value}, must be >= 0")
+    return value
+
+
 def _check_config_permissions(config_path: Path, jobs: list[JobConfig]) -> None:
     has_plaintext_password = any(job.password or job.smtp_password for job in jobs)
     if not has_plaintext_password:
@@ -215,6 +224,15 @@ def load_config(config_path: Path) -> list[JobConfig]:
     global_section = parser["global"] if parser.has_section("global") else {}
     global_base_dir = Path(global_section.get("base_dir", str(DEFAULT_BASE_DIR)))
     global_keep = _validate_keep("global", int(global_section.get("keep", DEFAULT_KEEP_GENERATIONS)))
+    global_keep_daily = _validate_gfs_keep(
+        "global", "keep_daily", int(global_section.get("keep_daily", 0))
+    )
+    global_keep_weekly = _validate_gfs_keep(
+        "global", "keep_weekly", int(global_section.get("keep_weekly", 0))
+    )
+    global_keep_monthly = _validate_gfs_keep(
+        "global", "keep_monthly", int(global_section.get("keep_monthly", 0))
+    )
     global_admin_mail = global_section.get("admin_mail", DEFAULT_ADMIN_MAIL)
     global_smtp_host = global_section.get("smtp_host", DEFAULT_SMTP_HOST)
     global_smtp_port = int(global_section.get("smtp_port", DEFAULT_SMTP_PORT))
@@ -268,6 +286,15 @@ def load_config(config_path: Path) -> list[JobConfig]:
                 exclude=_parse_exclude(section.get("exclude", global_exclude_raw)),
                 base_dir=Path(section.get("base_dir", str(global_base_dir))),
                 keep=_validate_keep(section_name, int(section.get("keep", global_keep))),
+                keep_daily=_validate_gfs_keep(
+                    section_name, "keep_daily", int(section.get("keep_daily", global_keep_daily))
+                ),
+                keep_weekly=_validate_gfs_keep(
+                    section_name, "keep_weekly", int(section.get("keep_weekly", global_keep_weekly))
+                ),
+                keep_monthly=_validate_gfs_keep(
+                    section_name, "keep_monthly", int(section.get("keep_monthly", global_keep_monthly))
+                ),
                 admin_mail=section.get("admin_mail", global_admin_mail),
                 smtp_host=section.get("smtp_host", global_smtp_host),
                 smtp_port=int(section.get("smtp_port", global_smtp_port)),
@@ -656,7 +683,48 @@ def dry_run_listing_sftp(
     return file_count, dir_count, total_bytes
 
 
-def rotate_backups(base_dir: Path, keep: int, logger: logging.Logger) -> None:
+def _gfs_bucket_key(generation: Path, period: str) -> tuple[int, int]:
+    timestamp = datetime.strptime(generation.name, "%Y%m%d_%H%M%S")
+    if period == "week":
+        iso_year, iso_week, _ = timestamp.isocalendar()
+        return (iso_year, iso_week)
+    return (timestamp.year, timestamp.month)
+
+
+def _select_gfs_survivors(
+    generations: list[Path], keep_daily: int, keep_weekly: int, keep_monthly: int
+) -> set[Path]:
+    """Selects which generations (sorted ascending) to keep under GFS retention.
+
+    Keeps the most recent keep_daily generations outright, plus the most
+    recent generation of each of the last keep_weekly ISO weeks and each of
+    the last keep_monthly calendar months.
+    """
+    survivors: set[Path] = set()
+
+    if keep_daily > 0:
+        survivors.update(generations[-keep_daily:])
+
+    for period, keep_n in (("week", keep_weekly), ("month", keep_monthly)):
+        if keep_n <= 0:
+            continue
+        latest_per_bucket: dict[tuple[int, int], Path] = {}
+        for generation in generations:
+            latest_per_bucket[_gfs_bucket_key(generation, period)] = generation
+        chosen = sorted(latest_per_bucket.values(), key=lambda d: d.name)[-keep_n:]
+        survivors.update(chosen)
+
+    return survivors
+
+
+def rotate_backups(
+    base_dir: Path,
+    keep: int,
+    logger: logging.Logger,
+    keep_daily: int = 0,
+    keep_weekly: int = 0,
+    keep_monthly: int = 0,
+) -> None:
     try:
         for stale in base_dir.glob("tmp_*"):
             logger.warning("Removing stale leftover from a previous failed run: %s", stale)
@@ -669,7 +737,13 @@ def rotate_backups(base_dir: Path, keep: int, logger: logging.Logger) -> None:
             (d for d in base_dir.iterdir() if d.is_dir() and not d.name.startswith("tmp_")),
             key=lambda d: d.name,
         )
-        obsolete = generations[:-keep]
+
+        if keep_daily or keep_weekly or keep_monthly:
+            survivors = _select_gfs_survivors(generations, keep_daily, keep_weekly, keep_monthly)
+            obsolete = [d for d in generations if d not in survivors]
+        else:
+            obsolete = generations[:-keep]
+
         for old_dir in obsolete:
             logger.info("Removing old backup generation %s", old_dir)
             shutil.rmtree(old_dir)
@@ -678,6 +752,8 @@ def rotate_backups(base_dir: Path, keep: int, logger: logging.Logger) -> None:
                 old_log.unlink()
     except OSError as exc:
         raise RotationError(f"Error cleaning up old generations in {base_dir}: {exc}") from exc
+    except ValueError as exc:
+        raise RotationError(f"Error parsing generation timestamp in {base_dir}: {exc}") from exc
 
 
 def _sanitize_subject(text: str, max_len: int = 200) -> str:
@@ -808,7 +884,9 @@ def run_job(job: JobConfig) -> bool:
         except OSError as exc:
             raise RotationError(f"Could not rename log {tmp_log_path} to {final_log_path}: {exc}") from exc
 
-        rotate_backups(job_base_dir, job.keep, logger)
+        rotate_backups(
+            job_base_dir, job.keep, logger, job.keep_daily, job.keep_weekly, job.keep_monthly
+        )
 
         if skipped:
             logger.warning(
