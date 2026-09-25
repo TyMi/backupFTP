@@ -120,7 +120,14 @@ timezone should be set correctly (`timedatectl status`).
 - Passwords should be passed via environment variables (`password_env` /
   `smtp_password_env`) rather than stored in plain text in the config.
 - If passwords are stored directly in the config anyway: restrict file
-  permissions to `600`.
+  permissions to `600`. A warning is printed at startup if a plaintext
+  password is configured and the config file is readable by group/other.
 - Filenames reported by the server are validated before being written
   locally to prevent a compromised/malicious FTP server from writing
   outside the backup directory (path traversal).
+- The process umask is set to `077` at startup, so mirrored backups and
+  logs are not readable by other local users regardless of the
+  system/cron default umask.
+- A single unreadable/failing file no longer aborts the whole job: it is
+  skipped and listed in the notification mail, and the run is reported
+  as a partial success (`SUCCEEDED (Teilerfolg: ...)`).

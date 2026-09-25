@@ -139,6 +139,19 @@ def _validate_keep(section_name: str, value: int) -> int:
     return value
 
 
+def _check_config_permissions(config_path: Path, jobs: list[JobConfig]) -> None:
+    has_plaintext_password = any(job.password or job.smtp_password for job in jobs)
+    if not has_plaintext_password:
+        return
+    mode = config_path.stat().st_mode
+    if mode & 0o077:
+        print(
+            f"Warning: {config_path} contains a plaintext password and is readable "
+            f"by group/other (mode {oct(mode & 0o777)}). Run: chmod 600 {config_path}",
+            file=sys.stderr,
+        )
+
+
 def load_config(config_path: Path) -> list[JobConfig]:
     if not config_path.is_file():
         raise ConfigError(f"Config file not found: {config_path}")
@@ -207,6 +220,8 @@ def load_config(config_path: Path) -> list[JobConfig]:
     if not jobs:
         raise ConfigError(f"No job sections found in {config_path}")
 
+    _check_config_permissions(config_path, jobs)
+
     return jobs
 
 
@@ -220,6 +235,11 @@ def get_ftp_password(job: JobConfig) -> str:
         )
     if job.password:
         return job.password
+    if not sys.stdin.isatty():
+        raise ConfigError(
+            f"Job '{job.name}': no password configured (password/password_env) "
+            "and no TTY available for an interactive prompt (e.g. running under cron)"
+        )
     return getpass.getpass(f"FTP password for '{job.name}' ({job.ftpuser}@{job.sourceserver}): ")
 
 
@@ -234,6 +254,11 @@ def get_smtp_password(job: JobConfig) -> str | None:
     if job.smtp_password:
         return job.smtp_password
     if job.smtp_user:
+        if not sys.stdin.isatty():
+            raise ConfigError(
+                f"Job '{job.name}': no SMTP password configured (smtp_password/smtp_password_env) "
+                "and no TTY available for an interactive prompt (e.g. running under cron)"
+            )
         return getpass.getpass(f"SMTP password for '{job.name}' ({job.smtp_user}@{job.smtp_host}): ")
     return None
 
@@ -298,7 +323,13 @@ def connect_ftp(
         raise FtpConnectionError(f"Connection to {sourceserver} failed: {exc}") from exc
 
 
-def mirror_ftp(ftp: ftplib.FTP, remote_dir: str, local_dir: Path, logger: logging.Logger) -> None:
+def mirror_ftp(
+    ftp: ftplib.FTP,
+    remote_dir: str,
+    local_dir: Path,
+    logger: logging.Logger,
+    skipped: list[str],
+) -> None:
     local_dir.mkdir(parents=True, exist_ok=True)
     local_dir_resolved = local_dir.resolve()
 
@@ -331,7 +362,7 @@ def mirror_ftp(ftp: ftplib.FTP, remote_dir: str, local_dir: Path, logger: loggin
 
         if entry_type == "dir":
             logger.debug("Directory: %s", remote_path)
-            mirror_ftp(ftp, remote_path, local_path, logger)
+            mirror_ftp(ftp, remote_path, local_path, logger, skipped)
             ftp.cwd(remote_dir)
         elif entry_type == "file":
             logger.debug("File: %s", remote_path)
@@ -339,7 +370,12 @@ def mirror_ftp(ftp: ftplib.FTP, remote_dir: str, local_dir: Path, logger: loggin
                 with open(local_path, "wb") as fh:
                     ftp.retrbinary(f"RETR {name}", fh.write)
             except (ftplib.all_errors, OSError) as exc:
-                raise DownloadError(f"Error downloading {remote_path}: {exc}") from exc
+                logger.warning("Skipping unreadable file %s: %s", remote_path, exc)
+                skipped.append(f"{remote_path}: {exc}")
+                try:
+                    local_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
         else:
             logger.debug("Skipping entry of type %s: %s", entry_type, remote_path)
 
@@ -445,8 +481,9 @@ def run_job(job: JobConfig) -> bool:
         ftp, used_tls = connect_ftp(
             job.sourceserver, job.ftpuser, ftppasswd, job.tls, job.tls_ca_file, logger
         )
+        skipped: list[str] = []
         try:
-            mirror_ftp(ftp, "/", tmp_dir, logger)
+            mirror_ftp(ftp, "/", tmp_dir, logger, skipped)
         finally:
             try:
                 ftp.quit()
@@ -466,9 +503,27 @@ def run_job(job: JobConfig) -> bool:
 
         rotate_backups(job_base_dir, job.keep, logger)
 
-        logger.info("Backup for '%s' completed successfully", job.name)
+        if skipped:
+            logger.warning(
+                "Backup for '%s' completed as partial success: %d file(s) skipped",
+                job.name,
+                len(skipped),
+            )
+        else:
+            logger.info("Backup for '%s' completed successfully", job.name)
+
         if job.notify_on_success:
-            subject_suffix = "" if used_tls else " (UNSICHER: Klartext-FTP, keine Verschluesselung)"
+            notes = []
+            if not used_tls:
+                notes.append("UNSICHER: Klartext-FTP, keine Verschluesselung")
+            if skipped:
+                notes.append(f"Teilerfolg: {len(skipped)} Datei(en) uebersprungen")
+            subject_suffix = f" ({', '.join(notes)})" if notes else ""
+            body = "OK"
+            if skipped:
+                body = "OK (Teilerfolg)\n\nFolgende Dateien konnten nicht gesichert werden:\n" + "\n".join(
+                    skipped
+                )
             send_mail(
                 job.smtp_host,
                 job.smtp_port,
@@ -476,7 +531,7 @@ def run_job(job: JobConfig) -> bool:
                 smtp_password,
                 job.admin_mail,
                 f"backupFTP for '{job.name}' ({job.sourceserver}) --> {final_dir} SUCCEEDED{subject_suffix}",
-                "OK",
+                body,
             )
         else:
             logger.info("Success notification suppressed (notify_on_success = false)")
@@ -493,6 +548,11 @@ def run_job(job: JobConfig) -> bool:
         current_log_path = _cleanup_failed_run(tmp_dir, tmp_log_path, failed_log_path, current_log_path, logger)
         _notify_failure(job, current_log_path, exc, smtp_password, logger)
         return False
+
+    finally:
+        for handler in list(logger.handlers):
+            handler.close()
+            logger.removeHandler(handler)
 
 
 def _cleanup_failed_run(
@@ -543,6 +603,7 @@ def _notify_failure(
 
 
 def main() -> int:
+    os.umask(0o077)
     args = parse_args()
 
     try:
