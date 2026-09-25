@@ -246,6 +246,8 @@ timezone should be set correctly (`timedatectl status`).
   and marked as insecure in the success mail), or `tls = off` to always
   use plain FTP. For servers with a self-signed/private-CA certificate,
   set `tls_ca_file` to a CA bundle instead of disabling verification.
+  Set `ftp_port` (default: `21`) if the server listens on a
+  non-standard port.
 - SFTP connections (`protocol = sftp`) always verify the server's host
   key and refuse to connect if it is unknown or does not match - this
   cannot be disabled, see "SFTP jobs" above.
@@ -282,6 +284,22 @@ timezone should be set correctly (`timedatectl status`).
   SSH or an HTTP endpoint before the FTP mirror runs) would close this
   gap, but is postponed for now since there is no current use case for
   it.
+
+## Development / running the tests
+
+`test/` contains the test suite (not needed to run `backupFTP.py`
+itself). It spins up real local FTP (`pyftpdlib`) and SFTP (`paramiko`)
+servers on ephemeral loopback ports, so it exercises the actual wire
+protocol - real `MLSD`/`LIST` output, real transfers, real host-key
+verification - rather than mocks.
+
+```bash
+pip install pytest pyftpdlib paramiko
+pytest -v
+```
+
+CI (`ruff`, `mypy`, `shellcheck`, `gitleaks` and this test suite) runs
+on every push/PR - see `.github/workflows/ci.yml`.
 
 ## License
 

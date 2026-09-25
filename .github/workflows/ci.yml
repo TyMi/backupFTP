@@ -98,3 +98,15 @@ jobs:
           set -e
           pip install paramiko
           python backupFTP.py --config backupFTP.conf --list-jobs
+
+  integration-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: pip install pytest pyftpdlib paramiko
+      - name: Run integration tests against real local FTP/SFTP servers
+        run: pytest -v

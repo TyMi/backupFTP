@@ -47,6 +47,7 @@ VALID_TLS_MODES = ("required", "preferred", "off")
 DEFAULT_TLS_MODE = "required"
 VALID_PROTOCOLS = ("ftp", "sftp")
 DEFAULT_PROTOCOL = "ftp"
+DEFAULT_FTP_PORT = 21
 DEFAULT_SFTP_PORT = 22
 DEFAULT_RETRIES = 0
 DEFAULT_RETRY_BACKOFF = 5.0
@@ -97,6 +98,7 @@ class JobConfig:
     protocol: str
     tls: str
     tls_ca_file: str | None
+    ftp_port: int
     sftp_port: int
     ssh_key_file: str | None
     known_hosts_file: str | None
@@ -274,6 +276,7 @@ def load_config(config_path: Path) -> list[JobConfig]:
     global_tls = _validate_tls_mode("global", global_section.get("tls", DEFAULT_TLS_MODE))
     global_tls_ca_file = global_section.get("tls_ca_file")
     global_protocol = _validate_protocol("global", global_section.get("protocol", DEFAULT_PROTOCOL))
+    global_ftp_port = int(global_section.get("ftp_port", DEFAULT_FTP_PORT))
     global_sftp_port = int(global_section.get("sftp_port", DEFAULT_SFTP_PORT))
     global_ssh_key_file = global_section.get("ssh_key_file")
     global_known_hosts_file = global_section.get("known_hosts_file")
@@ -327,6 +330,7 @@ def load_config(config_path: Path) -> list[JobConfig]:
                 protocol=_validate_protocol(section_name, section.get("protocol", global_protocol)),
                 tls=_validate_tls_mode(section_name, section.get("tls", global_tls)),
                 tls_ca_file=section.get("tls_ca_file", global_tls_ca_file),
+                ftp_port=int(section.get("ftp_port", global_ftp_port)),
                 sftp_port=int(section.get("sftp_port", global_sftp_port)),
                 ssh_key_file=section.get("ssh_key_file", global_ssh_key_file),
                 known_hosts_file=section.get("known_hosts_file", global_known_hosts_file),
@@ -424,6 +428,7 @@ def setup_logging(job_name: str, log_path: Path) -> logging.Logger:
 
 def connect_ftp(
     sourceserver: str,
+    port: int,
     ftpuser: str,
     ftppasswd: str,
     tls_mode: str,
@@ -438,31 +443,32 @@ def connect_ftp(
         try:
             ctx = ssl.create_default_context(cafile=tls_ca_file) if tls_ca_file else ssl.create_default_context()
             ftp = ftplib.FTP_TLS(context=ctx, timeout=30)
-            ftp.connect(sourceserver)
+            ftp.connect(sourceserver, port)
             ftp.login(ftpuser, ftppasswd)
             ftp.prot_p()
-            logger.info("Connected via FTPS (TLS, certificate verified) to %s", sourceserver)
+            logger.info("Connected via FTPS (TLS, certificate verified) to %s:%d", sourceserver, port)
             return ftp, True
         except FTPS_CONNECT_ERRORS as exc:
             if tls_mode == "required":
                 raise FtpConnectionError(
-                    f"FTPS (TLS) connection to {sourceserver} failed and tls=required: {exc}"
+                    f"FTPS (TLS) connection to {sourceserver}:{port} failed and tls=required: {exc}"
                 ) from exc
             logger.warning(
-                "FTPS not available/supported for %s (%s) - falling back to plain FTP "
+                "FTPS not available/supported for %s:%d (%s) - falling back to plain FTP "
                 "(tls=preferred, credentials will be sent in plaintext)",
                 sourceserver,
+                port,
                 exc,
             )
 
     try:
         ftp = ftplib.FTP(timeout=30)
-        ftp.connect(sourceserver)
+        ftp.connect(sourceserver, port)
         ftp.login(ftpuser, ftppasswd)
-        logger.info("Connected via plain FTP to %s", sourceserver)
+        logger.info("Connected via plain FTP to %s:%d", sourceserver, port)
         return ftp, False
     except ftplib.all_errors as exc:
-        raise FtpConnectionError(f"Connection to {sourceserver} failed: {exc}") from exc
+        raise FtpConnectionError(f"Connection to {sourceserver}:{port} failed: {exc}") from exc
 
 
 def connect_sftp(
@@ -1055,7 +1061,7 @@ def _connect_and_mirror(
             # job always has a password here.
             assert ftppasswd is not None
             ftp, used_tls = connect_ftp(
-                job.sourceserver, job.ftpuser, ftppasswd, job.tls, job.tls_ca_file, logger
+                job.sourceserver, job.ftp_port, job.ftpuser, ftppasswd, job.tls, job.tls_ca_file, logger
             )
             try:
                 if job.check_disk_space:
@@ -1233,7 +1239,7 @@ def run_job_dry_run(job: JobConfig) -> bool:
         else:
             assert ftppasswd is not None  # only None for protocol=sftp with a key file
             ftp, used_tls = connect_ftp(
-                job.sourceserver, job.ftpuser, ftppasswd, job.tls, job.tls_ca_file, logger
+                job.sourceserver, job.ftp_port, job.ftpuser, ftppasswd, job.tls, job.tls_ca_file, logger
             )
             try:
                 file_count, dir_count, total_bytes = dry_run_listing(ftp, "/", logger, job.exclude)

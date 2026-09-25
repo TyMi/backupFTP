@@ -29,6 +29,8 @@ keep = 7
 tls = required
 ; Only needed for servers with a self-signed/private-CA certificate:
 ; tls_ca_file = /path/to/ca-bundle.pem
+; Only needed if the FTP(S) server listens on a non-standard port:
+; ftp_port = 21
 admin_mail = admin@example.com
 smtp_host = localhost
 smtp_port = 25
