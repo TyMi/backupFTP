@@ -23,8 +23,9 @@ import smtplib
 import ssl
 import stat
 import sys
+import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -47,6 +48,9 @@ DEFAULT_TLS_MODE = "required"
 VALID_PROTOCOLS = ("ftp", "sftp")
 DEFAULT_PROTOCOL = "ftp"
 DEFAULT_SFTP_PORT = 22
+DEFAULT_RETRIES = 0
+DEFAULT_RETRY_BACKOFF = 5.0
+DEFAULT_CHECK_DISK_SPACE = True
 
 # ftplib.all_errors is itself a tuple; concatenating (rather than nesting it
 # inside another except tuple) keeps the result flat, as required by except.
@@ -97,6 +101,9 @@ class JobConfig:
     ssh_key_file: str | None
     known_hosts_file: str | None
     exclude: list[str]
+    retries: int
+    retry_backoff: float
+    check_disk_space: bool
     base_dir: Path
     keep: int
     keep_daily: int
@@ -206,6 +213,18 @@ def _validate_gfs_keep(section_name: str, option_name: str, value: int) -> int:
     return value
 
 
+def _validate_retries(section_name: str, value: int) -> int:
+    if value < 0:
+        raise ConfigError(f"Job '{section_name}': invalid retries={value}, must be >= 0")
+    return value
+
+
+def _validate_retry_backoff(section_name: str, value: float) -> float:
+    if value <= 0:
+        raise ConfigError(f"Job '{section_name}': invalid retry_backoff={value}, must be > 0")
+    return value
+
+
 def _check_config_permissions(config_path: Path, jobs: list[JobConfig]) -> None:
     has_plaintext_password = any(job.password or job.smtp_password for job in jobs)
     if not has_plaintext_password:
@@ -254,6 +273,13 @@ def load_config(config_path: Path) -> list[JobConfig]:
     global_ssh_key_file = global_section.get("ssh_key_file")
     global_known_hosts_file = global_section.get("known_hosts_file")
     global_exclude_raw = global_section.get("exclude")
+    global_retries = _validate_retries("global", int(global_section.get("retries", DEFAULT_RETRIES)))
+    global_retry_backoff = _validate_retry_backoff(
+        "global", float(global_section.get("retry_backoff", DEFAULT_RETRY_BACKOFF))
+    )
+    global_check_disk_space = _parse_bool(
+        global_section.get("check_disk_space"), DEFAULT_CHECK_DISK_SPACE
+    )
 
     jobs: list[JobConfig] = []
     for section_name in parser.sections():
@@ -289,6 +315,13 @@ def load_config(config_path: Path) -> list[JobConfig]:
                 ssh_key_file=section.get("ssh_key_file", global_ssh_key_file),
                 known_hosts_file=section.get("known_hosts_file", global_known_hosts_file),
                 exclude=_parse_exclude(section.get("exclude", global_exclude_raw)),
+                retries=_validate_retries(section_name, int(section.get("retries", global_retries))),
+                retry_backoff=_validate_retry_backoff(
+                    section_name, float(section.get("retry_backoff", global_retry_backoff))
+                ),
+                check_disk_space=_parse_bool(
+                    section.get("check_disk_space"), global_check_disk_space
+                ),
                 base_dir=Path(section.get("base_dir", str(global_base_dir))),
                 keep=_validate_keep(section_name, int(section.get("keep", global_keep))),
                 keep_daily=_validate_gfs_keep(
@@ -465,6 +498,113 @@ def connect_sftp(
         raise FtpConnectionError(f"SFTP connection to {sourceserver}:{port} failed: {exc}") from exc
 
 
+_UNIX_LIST_LINE_RE = re.compile(
+    r"^([\-dlbcps])[\-rwxXsStT]{9}\s+\d+\s+\S+\s+\S+\s+(\d+)\s+\S+\s+\S+\s+\S+\s+(.+)$"
+)
+
+
+def _parse_unix_list_line(line: str) -> tuple[str, dict[str, str]] | None:
+    """Parses one line of an old-style Unix LIST reply as a MLSD-like (name, facts) pair.
+
+    Used as a fallback for servers that don't support MLSD. LIST output is
+    not standardized; this covers the common vsftpd/ProFTPD/Pure-FTPd
+    ls -l style. Symlinks and other special entries are intentionally not
+    reported as dir/file (same as an unrecognized MLSD type).
+    """
+    match = _UNIX_LIST_LINE_RE.match(line.rstrip("\r\n"))
+    if not match:
+        return None
+    type_char, size, name = match.groups()
+    if type_char == "l" and " -> " in name:
+        name = name.split(" -> ", 1)[0]
+    if name in (".", ".."):
+        return None
+    entry_type = "dir" if type_char == "d" else "file" if type_char == "-" else "other"
+    return name, {"type": entry_type, "size": size}
+
+
+def _list_ftp_directory(
+    ftp: ftplib.FTP, remote_dir: str, logger: logging.Logger
+) -> list[tuple[str, dict[str, str]]]:
+    """Lists remote_dir via MLSD, falling back to parsing LIST if unsupported."""
+    try:
+        return list(ftp.mlsd(remote_dir))
+    except ftplib.error_perm as exc:
+        logger.warning(
+            "Server does not support MLSD for %s (%s) - falling back to LIST parsing",
+            remote_dir,
+            exc,
+        )
+    except ftplib.all_errors as exc:
+        raise DownloadError(f"Error listing {remote_dir}: {exc}") from exc
+
+    lines: list[str] = []
+    try:
+        ftp.retrlines(f"LIST {remote_dir}", lines.append)
+    except ftplib.all_errors as exc:
+        raise DownloadError(f"Error listing {remote_dir} via LIST: {exc}") from exc
+
+    entries: list[tuple[str, dict[str, str]]] = []
+    for line in lines:
+        parsed = _parse_unix_list_line(line)
+        if parsed is not None:
+            entries.append(parsed)
+    return entries
+
+
+def _parse_mlsd_modify(value: str) -> float | None:
+    """Parses an MLSD 'modify' fact (YYYYMMDDHHMMSS[.sss], RFC 3659 recommends
+    UTC, but not every server complies) into a Unix timestamp."""
+    try:
+        dt = datetime.strptime(value.split(".", 1)[0], "%Y%m%d%H%M%S")
+        return dt.replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def _find_latest_generation(job_base_dir: Path) -> Path | None:
+    if not job_base_dir.exists():
+        return None
+    generations = sorted(
+        (d for d in job_base_dir.iterdir() if d.is_dir() and not d.name.startswith("tmp_")),
+        key=lambda d: d.name,
+    )
+    return generations[-1] if generations else None
+
+
+def _try_reuse_from_previous(
+    prev_gen_dir: Path | None,
+    rel_path: str,
+    expected_size: str | int | None,
+    mtime: float | None,
+    local_path: Path,
+) -> int | None:
+    """Hardlinks an unchanged file from the previous generation instead of
+    downloading it again. Returns its size on success, None if not
+    applicable (no previous generation, missing facts, the file differs, or
+    linking fails for any reason) - the caller should then download normally.
+
+    "Unchanged" is a heuristic (size + mtime match, like rsync's quick
+    check), not a checksum - see the README for the trade-off.
+    """
+    if prev_gen_dir is None or expected_size is None or mtime is None:
+        return None
+    prev_file = prev_gen_dir / rel_path
+    try:
+        prev_stat = prev_file.stat()
+    except OSError:
+        return None
+    if prev_stat.st_size != int(expected_size):
+        return None
+    if abs(prev_stat.st_mtime - mtime) > 2:  # tolerate whole-second/rounding differences
+        return None
+    try:
+        os.link(prev_file, local_path)
+    except OSError:
+        return None
+    return prev_stat.st_size
+
+
 def mirror_ftp(
     ftp: ftplib.FTP,
     remote_dir: str,
@@ -472,23 +612,13 @@ def mirror_ftp(
     logger: logging.Logger,
     skipped: list[str],
     exclude: list[str],
+    stats: dict[str, int],
+    prev_gen_dir: Path | None = None,
 ) -> None:
     local_dir.mkdir(parents=True, exist_ok=True)
     local_dir_resolved = local_dir.resolve()
 
-    try:
-        ftp.cwd(remote_dir)
-    except ftplib.all_errors as exc:
-        raise DownloadError(f"Cannot change to remote directory {remote_dir}: {exc}") from exc
-
-    try:
-        entries = list(ftp.mlsd())
-    except ftplib.error_perm as exc:
-        raise DownloadError(
-            f"Server does not support MLSD, cannot mirror {remote_dir}: {exc}"
-        ) from exc
-    except ftplib.all_errors as exc:
-        raise DownloadError(f"Error listing {remote_dir}: {exc}") from exc
+    entries = _list_ftp_directory(ftp, remote_dir, logger)
 
     for name, facts in entries:
         if name in (".", ".."):
@@ -510,21 +640,34 @@ def mirror_ftp(
 
         if entry_type == "dir":
             logger.debug("Directory: %s", remote_path)
-            mirror_ftp(ftp, remote_path, local_path, logger, skipped, exclude)
-            ftp.cwd(remote_dir)
+            mirror_ftp(ftp, remote_path, local_path, logger, skipped, exclude, stats, prev_gen_dir)
         elif entry_type == "file":
             logger.debug("File: %s", remote_path)
+            expected_size = facts.get("size")
+            modify_value = facts.get("modify")
+            mtime = _parse_mlsd_modify(modify_value) if modify_value else None
+            reused_size = _try_reuse_from_previous(
+                prev_gen_dir, rel_path, expected_size, mtime, local_path
+            )
+            if reused_size is not None:
+                logger.debug("Unchanged since last generation, hardlinked: %s", remote_path)
+                stats["files"] += 1
+                stats["bytes"] += reused_size
+                stats["hardlinked"] += 1
+                continue
             try:
                 with open(local_path, "wb") as fh:
-                    ftp.retrbinary(f"RETR {name}", fh.write)
-                expected_size = facts.get("size")
-                if expected_size is not None:
-                    actual_size = local_path.stat().st_size
-                    if actual_size != int(expected_size):
-                        raise OSError(
-                            f"size mismatch after download: expected {expected_size} bytes, "
-                            f"got {actual_size}"
-                        )
+                    ftp.retrbinary(f"RETR {remote_path}", fh.write)
+                actual_size = local_path.stat().st_size
+                if expected_size is not None and actual_size != int(expected_size):
+                    raise OSError(
+                        f"size mismatch after download: expected {expected_size} bytes, "
+                        f"got {actual_size}"
+                    )
+                if mtime is not None:
+                    os.utime(local_path, (mtime, mtime))
+                stats["files"] += 1
+                stats["bytes"] += actual_size
             except FTP_TRANSFER_ERRORS as exc:
                 logger.warning("Skipping unreadable file %s: %s", remote_path, exc)
                 skipped.append(f"{remote_path}: {exc}")
@@ -543,6 +686,8 @@ def mirror_sftp(
     logger: logging.Logger,
     skipped: list[str],
     exclude: list[str],
+    stats: dict[str, int],
+    prev_gen_dir: Path | None = None,
 ) -> None:
     local_dir.mkdir(parents=True, exist_ok=True)
     local_dir_resolved = local_dir.resolve()
@@ -573,19 +718,32 @@ def mirror_sftp(
 
         if stat.S_ISDIR(mode):
             logger.debug("Directory: %s", remote_path)
-            mirror_sftp(sftp, remote_path, local_path, logger, skipped, exclude)
+            mirror_sftp(sftp, remote_path, local_path, logger, skipped, exclude, stats, prev_gen_dir)
         elif stat.S_ISREG(mode):
             logger.debug("File: %s", remote_path)
+            expected_size = attr.st_size
+            mtime = float(attr.st_mtime) if attr.st_mtime is not None else None
+            reused_size = _try_reuse_from_previous(
+                prev_gen_dir, rel_path, expected_size, mtime, local_path
+            )
+            if reused_size is not None:
+                logger.debug("Unchanged since last generation, hardlinked: %s", remote_path)
+                stats["files"] += 1
+                stats["bytes"] += reused_size
+                stats["hardlinked"] += 1
+                continue
             try:
                 sftp.get(remote_path, str(local_path))
-                expected_size = attr.st_size
-                if expected_size is not None:
-                    actual_size = local_path.stat().st_size
-                    if actual_size != expected_size:
-                        raise OSError(
-                            f"size mismatch after download: expected {expected_size} bytes, "
-                            f"got {actual_size}"
-                        )
+                actual_size = local_path.stat().st_size
+                if expected_size is not None and actual_size != expected_size:
+                    raise OSError(
+                        f"size mismatch after download: expected {expected_size} bytes, "
+                        f"got {actual_size}"
+                    )
+                if mtime is not None:
+                    os.utime(local_path, (mtime, mtime))
+                stats["files"] += 1
+                stats["bytes"] += actual_size
             except (OSError, paramiko.SSHException) as exc:
                 logger.warning("Skipping unreadable file %s: %s", remote_path, exc)
                 skipped.append(f"{remote_path}: {exc}")
@@ -604,19 +762,7 @@ def dry_run_listing(
 
     Returns (file_count, dir_count, total_bytes).
     """
-    try:
-        ftp.cwd(remote_dir)
-    except ftplib.all_errors as exc:
-        raise DownloadError(f"Cannot change to remote directory {remote_dir}: {exc}") from exc
-
-    try:
-        entries = list(ftp.mlsd())
-    except ftplib.error_perm as exc:
-        raise DownloadError(
-            f"Server does not support MLSD, cannot list {remote_dir}: {exc}"
-        ) from exc
-    except ftplib.all_errors as exc:
-        raise DownloadError(f"Error listing {remote_dir}: {exc}") from exc
+    entries = _list_ftp_directory(ftp, remote_dir, logger)
 
     file_count = 0
     dir_count = 0
@@ -640,7 +786,6 @@ def dry_run_listing(
             file_count += sub_files
             dir_count += sub_dirs
             total_bytes += sub_bytes
-            ftp.cwd(remote_dir)
         elif entry_type == "file":
             file_count += 1
             try:
@@ -810,49 +955,121 @@ def send_mail(
         raise MailError(f"Error sending mail via {smtp_host}:{smtp_port}: {exc}") from exc
 
 
+def _clear_directory(path: Path) -> None:
+    """Removes the contents of path (but not path itself), for a clean retry."""
+    if not path.exists():
+        return
+    for entry in path.iterdir():
+        if entry.is_dir():
+            shutil.rmtree(entry)
+        else:
+            entry.unlink()
+
+
+def _check_free_disk_space(estimated_bytes: int, tmp_dir: Path, logger: logging.Logger) -> None:
+    """Raises DownloadError if estimated_bytes (with a safety margin) exceeds free space.
+
+    Fails the job early instead of mid-transfer.
+    """
+    free_bytes = shutil.disk_usage(tmp_dir).free
+    margin = 1.1
+    if estimated_bytes * margin > free_bytes:
+        raise DownloadError(
+            f"Insufficient disk space: estimated {estimated_bytes} bytes needed "
+            f"(x{margin:.1f} safety margin) but only {free_bytes} bytes free in {tmp_dir}"
+        )
+    logger.debug(
+        "Disk space check OK: estimated %d bytes needed, %d bytes free", estimated_bytes, free_bytes
+    )
+
+
 def _connect_and_mirror(
-    job: JobConfig, ftppasswd: str | None, tmp_dir: Path, logger: logging.Logger
-) -> tuple[bool, list[str]]:
+    job: JobConfig,
+    ftppasswd: str | None,
+    tmp_dir: Path,
+    prev_gen_dir: Path | None,
+    logger: logging.Logger,
+) -> tuple[bool, list[str], dict[str, int]]:
     """Connects via the job's configured protocol and mirrors it into tmp_dir.
 
-    Returns (transport_secure, skipped) - transport_secure is False only for
-    a plain-text FTP fallback (tls=preferred); SFTP is always host-key
-    verified and therefore always reported as secure.
+    Retries the whole connect+mirror attempt up to job.retries times, with
+    exponential backoff (job.retry_backoff * 2**attempt), on a transient
+    connection/listing/download error.
+
+    Returns (transport_secure, skipped, stats) - transport_secure is False
+    only for a plain-text FTP fallback (tls=preferred); SFTP is always
+    host-key verified and therefore always reported as secure.
     """
-    skipped: list[str] = []
-
-    if job.protocol == "sftp":
-        sftp, ssh_client = connect_sftp(
-            job.sourceserver,
-            job.sftp_port,
-            job.ftpuser,
-            ftppasswd,
-            job.ssh_key_file,
-            job.known_hosts_file,
-            logger,
-        )
+    attempt = 0
+    while True:
+        skipped: list[str] = []
+        stats = {"files": 0, "bytes": 0, "hardlinked": 0}
         try:
-            mirror_sftp(sftp, "/", tmp_dir, logger, skipped, job.exclude)
-        finally:
-            sftp.close()
-            ssh_client.close()
-        return True, skipped
+            if job.protocol == "sftp":
+                sftp, ssh_client = connect_sftp(
+                    job.sourceserver,
+                    job.sftp_port,
+                    job.ftpuser,
+                    ftppasswd,
+                    job.ssh_key_file,
+                    job.known_hosts_file,
+                    logger,
+                )
+                try:
+                    if job.check_disk_space:
+                        try:
+                            _, _, estimated_bytes = dry_run_listing_sftp(
+                                sftp, "/", logger, job.exclude
+                            )
+                        except DownloadError as exc:
+                            logger.debug("Skipping disk space check, listing failed: %s", exc)
+                        else:
+                            _check_free_disk_space(estimated_bytes, tmp_dir, logger)
+                    mirror_sftp(
+                        sftp, "/", tmp_dir, logger, skipped, job.exclude, stats, prev_gen_dir
+                    )
+                finally:
+                    sftp.close()
+                    ssh_client.close()
+                return True, skipped, stats
 
-    # get_ftp_password() only ever returns None for protocol=sftp with a key
-    # file, and that path already returned above - a plain FTP job always has
-    # a password here.
-    assert ftppasswd is not None
-    ftp, used_tls = connect_ftp(
-        job.sourceserver, job.ftpuser, ftppasswd, job.tls, job.tls_ca_file, logger
-    )
-    try:
-        mirror_ftp(ftp, "/", tmp_dir, logger, skipped, job.exclude)
-    finally:
-        try:
-            ftp.quit()
-        except ftplib.all_errors:
-            ftp.close()
-    return used_tls, skipped
+            # get_ftp_password() only ever returns None for protocol=sftp with
+            # a key file, and that path already returned above - a plain FTP
+            # job always has a password here.
+            assert ftppasswd is not None
+            ftp, used_tls = connect_ftp(
+                job.sourceserver, job.ftpuser, ftppasswd, job.tls, job.tls_ca_file, logger
+            )
+            try:
+                if job.check_disk_space:
+                    try:
+                        _, _, estimated_bytes = dry_run_listing(ftp, "/", logger, job.exclude)
+                    except DownloadError as exc:
+                        logger.debug("Skipping disk space check, listing failed: %s", exc)
+                    else:
+                        _check_free_disk_space(estimated_bytes, tmp_dir, logger)
+                mirror_ftp(ftp, "/", tmp_dir, logger, skipped, job.exclude, stats, prev_gen_dir)
+            finally:
+                try:
+                    ftp.quit()
+                except ftplib.all_errors:
+                    ftp.close()
+            return used_tls, skipped, stats
+
+        except (FtpConnectionError, DownloadError) as exc:
+            if attempt >= job.retries:
+                raise
+            delay = job.retry_backoff * (2**attempt)
+            attempt += 1
+            logger.warning(
+                "Transient error on attempt %d/%d, retrying in %.1fs: %s",
+                attempt,
+                job.retries + 1,
+                delay,
+                exc,
+            )
+            time.sleep(delay)
+            _clear_directory(tmp_dir)
 
 
 def run_job(job: JobConfig) -> bool:
@@ -878,12 +1095,17 @@ def run_job(job: JobConfig) -> bool:
 
     smtp_password: str | None = None
     current_log_path = tmp_log_path
+    start_time = time.monotonic()
 
     try:
         ftppasswd = get_ftp_password(job)
         smtp_password = get_smtp_password(job)
 
-        used_tls, skipped = _connect_and_mirror(job, ftppasswd, tmp_dir, logger)
+        prev_gen_dir = _find_latest_generation(job_base_dir)
+        used_tls, skipped, stats = _connect_and_mirror(
+            job, ftppasswd, tmp_dir, prev_gen_dir, logger
+        )
+        duration = time.monotonic() - start_time
 
         try:
             tmp_dir.rename(final_dir)
@@ -916,11 +1138,16 @@ def run_job(job: JobConfig) -> bool:
             if skipped:
                 notes.append(f"Teilerfolg: {len(skipped)} Datei(en) uebersprungen")
             subject_suffix = f" ({', '.join(notes)})" if notes else ""
-            body = "OK"
+            body = (
+                f"OK\n\n"
+                f"Dateien: {stats['files']} (davon {stats['hardlinked']} unveraendert "
+                f"aus der Vorgaenger-Generation uebernommen)\n"
+                f"Groesse: {stats['bytes'] / (1024 * 1024):.1f} MiB\n"
+                f"Dauer: {duration:.1f} s\n"
+                f"TLS/Host-Key verifiziert: {'ja' if used_tls else 'NEIN'}"
+            )
             if skipped:
-                body = "OK (Teilerfolg)\n\nFolgende Dateien konnten nicht gesichert werden:\n" + "\n".join(
-                    skipped
-                )
+                body += "\n\nFolgende Dateien konnten nicht gesichert werden:\n" + "\n".join(skipped)
             send_mail(
                 job.smtp_host,
                 job.smtp_port,

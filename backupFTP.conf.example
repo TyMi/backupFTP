@@ -49,6 +49,15 @@ notify_on_success = true
 ; path relative to the job root, to skip entirely (files AND, for a
 ; matching directory itself, its whole subtree - no round-trip into it):
 ; exclude = cache/*, *.log, wp-content/uploads/cache/*
+; Retry the whole connect+mirror attempt this many times on a transient
+; error, waiting retry_backoff seconds (doubling each attempt) between
+; tries. 0 (default) = fail immediately, no retry.
+; retries = 3
+; retry_backoff = 5
+; Before mirroring, estimate the transfer size and compare it to free
+; disk space (10% margin); fail early instead of running out of space
+; mid-transfer. Costs one extra listing pass over the whole tree.
+; check_disk_space = true
 
 ; One job per section. The section name (here "example1") is used as the
 ; directory name under base_dir (only a-z, 0-9, - and _) and serves as the

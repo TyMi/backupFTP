@@ -68,6 +68,42 @@ plain web space content. Only the last `keep` generations (default: 7),
 including their log, are kept automatically; older ones are removed on
 every successful run.
 
+## Incremental backups (hardlinks)
+
+Every run compares each remote file's size and modification time (from
+`MLSD`'s `modify` fact, or SFTP's file attributes) against the same file
+in the previous generation. If both match, the file is **not**
+downloaded again - it is hardlinked from the previous generation instead
+(`os.link()`), at zero extra network transfer and zero extra disk space.
+Only new or changed files are actually transferred. This happens
+automatically whenever a previous generation exists; there is no option
+to turn it off, and none is needed to turn it on.
+
+**Important limitation - this is a heuristic, not a checksum:**
+size+mtime matching is the same "quick check" `rsync` uses by default,
+not a content hash. A file with the exact same size that was rewritten
+with different content at the exact same recorded mtime would be
+(incorrectly) treated as unchanged and skipped. This is a known,
+accepted trade-off for avoiding a full download+hash of every file on
+every run - the same trade-off essentially every hardlink-based backup
+tool (`rsync --link-dest`, `rsnapshot`, Time Machine) makes. It also
+depends on the server reporting `modify`/mtime correctly; RFC 3659
+recommends UTC for `MLSD`, but not every FTP server complies, and
+servers without `MLSD` support (see "Excluding files" below regarding
+the `LIST` fallback) don't provide a comparably reliable timestamp at
+all, so incremental reuse effectively does not trigger for those and
+every file is downloaded normally.
+
+**Also important:** unchanged files are physically shared (hardlinked)
+between generations - the same file may exist under several
+`<base_dir>/<job_key>/<timestamp>/` directories while only occupying
+disk space once. Treat every generation directory as **read-only**.
+Editing a file in place inside an old generation would silently change
+it in every other generation sharing that hardlink. Deleting a whole
+generation directory (as rotation already does) is always safe - the
+underlying data is only actually freed once its last hardlink is
+removed, exactly like any other file on the filesystem.
+
 ## Retention (flat count or GFS)
 
 By default, `keep` retains a flat number of the most recent generations
@@ -127,13 +163,33 @@ into it at all - not just its files one by one. `--dry-run` respects
 `exclude` too, so its size estimate matches what an actual run would
 transfer.
 
+## Retries and disk space checking
+
+Set `retries` (default: `0`) to retry the whole connect+mirror attempt
+on a transient connection or transfer error, instead of failing the job
+immediately - useful for flaky links or servers that occasionally drop
+the connection (e.g. a timeout or a `421` reply). Each retry waits
+`retry_backoff` seconds (default: `5`), doubling every attempt
+(exponential backoff). A failed attempt's partial download is discarded
+before the next try. This does not resume a partially transferred file
+or tree - each retry starts the mirror over from scratch.
+
+Before mirroring, a listing pass estimates the total transfer size and
+compares it against the free space in `base_dir` (10% safety margin);
+if it looks insufficient, the job fails immediately with a clear error
+instead of running out of disk space mid-transfer. Set
+`check_disk_space = false` to skip this (it costs one extra listing
+pass over the whole tree).
+
 ## Email notifications
 
 By default, every run sends an email: on success a short "SUCCEEDED"
-notice, on failure the collected log plus the error. To only be notified
-about failures, set `notify_on_success = false` in `[global]` and/or in a
-specific job section (job setting overrides the global default). Failure
-emails are always sent regardless of this setting.
+notice with file count, transferred size, duration and whether the
+transport was verified/encrypted; on failure the collected log plus the
+error. To only be notified about failures, set `notify_on_success =
+false` in `[global]` and/or in a specific job section (job setting
+overrides the global default). Failure emails are always sent
+regardless of this setting.
 
 ## Automated operation (cron.daily)
 
