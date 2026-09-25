@@ -112,6 +112,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="List configured jobs and exit, without running a backup",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Connect, list and estimate the transfer size only; "
+        "do not download, write, rotate or send mail",
+    )
     return parser.parse_args()
 
 
@@ -380,6 +386,55 @@ def mirror_ftp(
             logger.debug("Skipping entry of type %s: %s", entry_type, remote_path)
 
 
+def dry_run_listing(ftp: ftplib.FTP, remote_dir: str, logger: logging.Logger) -> tuple[int, int, int]:
+    """Recursively lists the server like mirror_ftp, but writes nothing locally.
+
+    Returns (file_count, dir_count, total_bytes).
+    """
+    try:
+        ftp.cwd(remote_dir)
+    except ftplib.all_errors as exc:
+        raise DownloadError(f"Cannot change to remote directory {remote_dir}: {exc}") from exc
+
+    try:
+        entries = list(ftp.mlsd())
+    except ftplib.error_perm as exc:
+        raise DownloadError(
+            f"Server does not support MLSD, cannot list {remote_dir}: {exc}"
+        ) from exc
+    except ftplib.all_errors as exc:
+        raise DownloadError(f"Error listing {remote_dir}: {exc}") from exc
+
+    file_count = 0
+    dir_count = 0
+    total_bytes = 0
+
+    for name, facts in entries:
+        if name in (".", ".."):
+            continue
+        if not name or "/" in name or "\\" in name:
+            continue
+
+        entry_type = facts.get("type", "file")
+        remote_path = f"{remote_dir}/{name}" if remote_dir != "/" else f"/{name}"
+
+        if entry_type == "dir":
+            dir_count += 1
+            sub_files, sub_dirs, sub_bytes = dry_run_listing(ftp, remote_path, logger)
+            file_count += sub_files
+            dir_count += sub_dirs
+            total_bytes += sub_bytes
+            ftp.cwd(remote_dir)
+        elif entry_type == "file":
+            file_count += 1
+            try:
+                total_bytes += int(facts.get("size", 0))
+            except ValueError:
+                logger.debug("No usable size fact for %s", remote_path)
+
+    return file_count, dir_count, total_bytes
+
+
 def rotate_backups(base_dir: Path, keep: int, logger: logging.Logger) -> None:
     try:
         for stale in base_dir.glob("tmp_*"):
@@ -555,6 +610,54 @@ def run_job(job: JobConfig) -> bool:
             logger.removeHandler(handler)
 
 
+def run_job_dry_run(job: JobConfig) -> bool:
+    """Connects, lists and estimates the transfer size. Writes nothing to disk."""
+
+    logger = logging.getLogger(f"backupFTP.{job.name}")
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
+    logger.propagate = False
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(
+        logging.Formatter(f"%(asctime)s [%(levelname)s] [{job.name}] %(message)s")
+    )
+    logger.addHandler(console_handler)
+
+    try:
+        ftppasswd = get_ftp_password(job)
+        ftp, used_tls = connect_ftp(
+            job.sourceserver, job.ftpuser, ftppasswd, job.tls, job.tls_ca_file, logger
+        )
+        try:
+            file_count, dir_count, total_bytes = dry_run_listing(ftp, "/", logger)
+        finally:
+            try:
+                ftp.quit()
+            except ftplib.all_errors:
+                ftp.close()
+
+        logger.info(
+            "DRY-RUN for '%s' (%s): %d file(s) in %d director(y/ies), %.1f MiB total "
+            "(tls=%s) - nothing downloaded",
+            job.name,
+            job.sourceserver,
+            file_count,
+            dir_count,
+            total_bytes / (1024 * 1024),
+            "yes" if used_tls else "NO",
+        )
+        return True
+
+    except BackupError as exc:
+        logger.error("Dry-run for '%s' failed: %s", job.name, exc)
+        return False
+
+    finally:
+        for handler in list(logger.handlers):
+            handler.close()
+            logger.removeHandler(handler)
+
+
 def _cleanup_failed_run(
     tmp_dir: Path,
     tmp_log_path: Path,
@@ -623,6 +726,10 @@ def main() -> int:
             print(f"Unknown job keys: {', '.join(sorted(unknown))}", file=sys.stderr)
             return 1
         jobs = [job for job in jobs if job.key in args.jobs]
+
+    if args.dry_run:
+        results = [run_job_dry_run(job) for job in jobs]
+        return 0 if all(results) else 1
 
     results = [run_job(job) for job in jobs]
     return 0 if all(results) else 1

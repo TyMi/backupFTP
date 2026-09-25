@@ -42,6 +42,10 @@ python3 backupFTP.py --config backupFTP.conf --job example1
 
 # List configured jobs without running a backup
 python3 backupFTP.py --config backupFTP.conf --list-jobs
+
+# Connect, list and estimate the transfer size only - no download,
+# no directory/log created, no rotation, no mail sent
+python3 backupFTP.py --config backupFTP.conf --dry-run
 ```
 
 Without `--config`, `backupFTP.conf` is expected next to the script.
@@ -131,3 +135,13 @@ timezone should be set correctly (`timedatectl status`).
 - A single unreadable/failing file no longer aborts the whole job: it is
   skipped and listed in the notification mail, and the run is reported
   as a partial success (`SUCCEEDED (Teilerfolg: ...)`).
+
+## Known limitations / not currently planned
+
+- **No database dump.** For a web space whose application relies on a
+  database (e.g. WordPress, most CMS/shop systems), this tool only
+  backs up the FTP-visible files - the database itself is not included
+  and needs a separate backup. A per-job DB dump hook (triggered via
+  SSH or an HTTP endpoint before the FTP mirror runs) would close this
+  gap, but is postponed for now since there is no current use case for
+  it.
