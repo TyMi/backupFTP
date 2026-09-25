@@ -41,8 +41,9 @@ failure of each run.
 # Run all configured jobs
 python3 backupFTP.py --config backupFTP.conf
 
-# Run only specific jobs (section name from the config)
-python3 backupFTP.py --config backupFTP.conf --job example1
+# Run only specific jobs (section name from the config); --job can be
+# given multiple times to select more than one
+python3 backupFTP.py --config backupFTP.conf --job example1 --job example2
 
 # List configured jobs without running a backup
 python3 backupFTP.py --config backupFTP.conf --list-jobs
@@ -59,15 +60,20 @@ Without `--config`, `backupFTP.conf` is expected next to the script.
 Each job/run produces the following under `<base_dir>/<job_key>/`:
 
 ```
-<base_dir>/<job_key>/<timestamp>/        mirrored web space content
-<base_dir>/<job_key>/<timestamp>.log     log for this run
+<base_dir>/<job_key>/<timestamp>/               mirrored web space content
+<base_dir>/<job_key>/<timestamp>.log            log for this run
+<base_dir>/<job_key>/<timestamp>.failed.log     log of a failed run (no matching directory)
 ```
 
 Log and data are intentionally kept separate (the log is **not** inside
 the mirrored directory), so that a restore only ever brings back the
 plain web space content. Only the last `keep` generations (default: 7),
 including their log, are kept automatically; older ones are removed on
-every successful run.
+every successful run. A failed run has no generation directory (the
+incomplete mirror is discarded) but keeps its log as `.failed.log` for
+troubleshooting; these are capped to the most recent `keep` (or `1`,
+whichever is larger) independently of the generations above, so they
+don't accumulate unbounded across repeated failures.
 
 ## Incremental backups (hardlinks)
 
@@ -89,11 +95,13 @@ accepted trade-off for avoiding a full download+hash of every file on
 every run - the same trade-off essentially every hardlink-based backup
 tool (`rsync --link-dest`, `rsnapshot`, Time Machine) makes. It also
 depends on the server reporting `modify`/mtime correctly; RFC 3659
-recommends UTC for `MLSD`, but not every FTP server complies, and
-servers without `MLSD` support (see "Excluding files" below regarding
-the `LIST` fallback) don't provide a comparably reliable timestamp at
-all, so incremental reuse effectively does not trigger for those and
-every file is downloaded normally.
+recommends UTC for `MLSD`, but not every FTP server complies. Servers
+without `MLSD` support at all are mirrored via a `LIST` fallback
+instead (a Unix `ls -l` style listing, covering vsftpd/ProFTPD/
+Pure-FTPd - no configuration needed, this is detected and used
+automatically); that fallback doesn't provide a comparably reliable
+timestamp, so incremental reuse effectively does not trigger for those
+servers and every file is downloaded normally on every run.
 
 **Also important:** unchanged files are physically shared (hardlinked)
 between generations - the same file may exist under several
@@ -268,7 +276,7 @@ timezone should be set correctly (`timedatectl status`).
   system/cron default umask.
 - A single unreadable/failing file no longer aborts the whole job: it is
   skipped and listed in the notification mail, and the run is reported
-  as a partial success (`SUCCEEDED (Teilerfolg: ...)`).
+  as a partial success (`SUCCEEDED (partial success: ...)`).
 - Each downloaded file's size is compared against the size the server
   reported while listing it; a mismatch (e.g. a transfer that ended
   early without the client noticing) is treated like any other failed

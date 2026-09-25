@@ -8,6 +8,8 @@
 ; overridden per job section.
 
 [global]
+; Where backups are stored, as <base_dir>/<job_key>/<timestamp>/ per
+; generation (see README "Directory structure").
 base_dir = /data/bak
 keep = 7
 ; Optional: GFS-style retention (grandfather-father-son) instead of the
