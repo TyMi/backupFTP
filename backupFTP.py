@@ -35,6 +35,8 @@ DEFAULT_KEEP_GENERATIONS = 7
 
 VALID_JOB_KEY = re.compile(r"^[a-zA-Z0-9_-]+$")
 DEFAULT_NOTIFY_ON_SUCCESS = True
+VALID_TLS_MODES = ("required", "preferred", "off")
+DEFAULT_TLS_MODE = "required"
 
 
 class BackupError(Exception):
@@ -73,6 +75,8 @@ class JobConfig:
     ftpuser: str
     password: str | None
     password_env: str | None
+    tls: str
+    tls_ca_file: str | None
     base_dir: Path
     keep: int
     admin_mail: str
@@ -117,6 +121,24 @@ def _parse_bool(value: str | None, default: bool) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _validate_tls_mode(section_name: str, value: str) -> str:
+    if value not in VALID_TLS_MODES:
+        raise ConfigError(
+            f"Job '{section_name}': invalid tls mode '{value}', "
+            f"must be one of {', '.join(VALID_TLS_MODES)}"
+        )
+    return value
+
+
+def _validate_keep(section_name: str, value: int) -> int:
+    if value < 1:
+        raise ConfigError(
+            f"Job '{section_name}': invalid keep={value}, must be >= 1 "
+            "(keep=0 or negative would delete the backup just created)"
+        )
+    return value
+
+
 def load_config(config_path: Path) -> list[JobConfig]:
     if not config_path.is_file():
         raise ConfigError(f"Config file not found: {config_path}")
@@ -126,7 +148,7 @@ def load_config(config_path: Path) -> list[JobConfig]:
 
     global_section = parser["global"] if parser.has_section("global") else {}
     global_base_dir = Path(global_section.get("base_dir", str(DEFAULT_BASE_DIR)))
-    global_keep = int(global_section.get("keep", DEFAULT_KEEP_GENERATIONS))
+    global_keep = _validate_keep("global", int(global_section.get("keep", DEFAULT_KEEP_GENERATIONS)))
     global_admin_mail = global_section.get("admin_mail", DEFAULT_ADMIN_MAIL)
     global_smtp_host = global_section.get("smtp_host", DEFAULT_SMTP_HOST)
     global_smtp_port = int(global_section.get("smtp_port", DEFAULT_SMTP_PORT))
@@ -136,6 +158,8 @@ def load_config(config_path: Path) -> list[JobConfig]:
     global_notify_on_success = _parse_bool(
         global_section.get("notify_on_success"), DEFAULT_NOTIFY_ON_SUCCESS
     )
+    global_tls = _validate_tls_mode("global", global_section.get("tls", DEFAULT_TLS_MODE))
+    global_tls_ca_file = global_section.get("tls_ca_file")
 
     jobs: list[JobConfig] = []
     for section_name in parser.sections():
@@ -164,8 +188,10 @@ def load_config(config_path: Path) -> list[JobConfig]:
                 ftpuser=ftpuser,
                 password=section.get("password"),
                 password_env=section.get("password_env"),
+                tls=_validate_tls_mode(section_name, section.get("tls", global_tls)),
+                tls_ca_file=section.get("tls_ca_file", global_tls_ca_file),
                 base_dir=Path(section.get("base_dir", str(global_base_dir))),
-                keep=int(section.get("keep", global_keep)),
+                keep=_validate_keep(section_name, int(section.get("keep", global_keep))),
                 admin_mail=section.get("admin_mail", global_admin_mail),
                 smtp_host=section.get("smtp_host", global_smtp_host),
                 smtp_port=int(section.get("smtp_port", global_smtp_port)),
@@ -231,33 +257,50 @@ def setup_logging(job_name: str, log_path: Path) -> logging.Logger:
     return logger
 
 
-def connect_ftp(sourceserver: str, ftpuser: str, ftppasswd: str, logger: logging.Logger) -> ftplib.FTP:
-    try:
-        ftp = ftplib.FTP_TLS(timeout=30)
-        ftp.connect(sourceserver)
-        ftp.login(ftpuser, ftppasswd)
-        ftp.prot_p()
-        logger.info("Connected via FTPS (TLS) to %s", sourceserver)
-        return ftp
-    except (ftplib.all_errors, ssl.SSLError, OSError) as exc:
-        logger.warning(
-            "FTPS not available/supported for %s (%s) - falling back to plain FTP",
-            sourceserver,
-            exc,
-        )
+def connect_ftp(
+    sourceserver: str,
+    ftpuser: str,
+    ftppasswd: str,
+    tls_mode: str,
+    tls_ca_file: str | None,
+    logger: logging.Logger,
+) -> tuple[ftplib.FTP, bool]:
+    """Connects and logs in. Returns (ftp, used_tls)."""
+
+    if tls_mode in ("required", "preferred"):
+        try:
+            ctx = ssl.create_default_context(cafile=tls_ca_file) if tls_ca_file else ssl.create_default_context()
+            ftp = ftplib.FTP_TLS(context=ctx, timeout=30)
+            ftp.connect(sourceserver)
+            ftp.login(ftpuser, ftppasswd)
+            ftp.prot_p()
+            logger.info("Connected via FTPS (TLS, certificate verified) to %s", sourceserver)
+            return ftp, True
+        except (ftplib.all_errors, ssl.SSLError, OSError) as exc:
+            if tls_mode == "required":
+                raise FtpConnectionError(
+                    f"FTPS (TLS) connection to {sourceserver} failed and tls=required: {exc}"
+                ) from exc
+            logger.warning(
+                "FTPS not available/supported for %s (%s) - falling back to plain FTP "
+                "(tls=preferred, credentials will be sent in plaintext)",
+                sourceserver,
+                exc,
+            )
 
     try:
         ftp = ftplib.FTP(timeout=30)
         ftp.connect(sourceserver)
         ftp.login(ftpuser, ftppasswd)
         logger.info("Connected via plain FTP to %s", sourceserver)
-        return ftp
+        return ftp, False
     except ftplib.all_errors as exc:
         raise FtpConnectionError(f"Connection to {sourceserver} failed: {exc}") from exc
 
 
 def mirror_ftp(ftp: ftplib.FTP, remote_dir: str, local_dir: Path, logger: logging.Logger) -> None:
     local_dir.mkdir(parents=True, exist_ok=True)
+    local_dir_resolved = local_dir.resolve()
 
     try:
         ftp.cwd(remote_dir)
@@ -276,10 +319,15 @@ def mirror_ftp(ftp: ftplib.FTP, remote_dir: str, local_dir: Path, logger: loggin
     for name, facts in entries:
         if name in (".", ".."):
             continue
+        if not name or "/" in name or "\\" in name:
+            logger.warning("Suspicious entry from server skipped: %r", name)
+            continue
 
         entry_type = facts.get("type", "file")
         remote_path = f"{remote_dir}/{name}" if remote_dir != "/" else f"/{name}"
-        local_path = local_dir / name
+        local_path = (local_dir / name).resolve()
+        if not local_path.is_relative_to(local_dir_resolved):
+            raise DownloadError(f"Path traversal attempt via server filename: {name!r}")
 
         if entry_type == "dir":
             logger.debug("Directory: %s", remote_path)
@@ -298,11 +346,18 @@ def mirror_ftp(ftp: ftplib.FTP, remote_dir: str, local_dir: Path, logger: loggin
 
 def rotate_backups(base_dir: Path, keep: int, logger: logging.Logger) -> None:
     try:
+        for stale in base_dir.glob("tmp_*"):
+            logger.warning("Removing stale leftover from a previous failed run: %s", stale)
+            if stale.is_dir():
+                shutil.rmtree(stale)
+            else:
+                stale.unlink()
+
         generations = sorted(
             (d for d in base_dir.iterdir() if d.is_dir() and not d.name.startswith("tmp_")),
             key=lambda d: d.name,
         )
-        obsolete = generations[:-keep] if keep > 0 else generations
+        obsolete = generations[:-keep]
         for old_dir in obsolete:
             logger.info("Removing old backup generation %s", old_dir)
             shutil.rmtree(old_dir)
@@ -311,6 +366,11 @@ def rotate_backups(base_dir: Path, keep: int, logger: logging.Logger) -> None:
                 old_log.unlink()
     except OSError as exc:
         raise RotationError(f"Error cleaning up old generations in {base_dir}: {exc}") from exc
+
+
+def _sanitize_subject(text: str, max_len: int = 200) -> str:
+    """Mail headers may not contain line breaks; collapse and truncate."""
+    return " ".join(text.split())[:max_len]
 
 
 def send_mail(
@@ -325,22 +385,28 @@ def send_mail(
     msg = EmailMessage()
     msg["From"] = smtp_user or admin_mail
     msg["To"] = admin_mail
-    msg["Subject"] = subject
+    msg["Subject"] = _sanitize_subject(subject)
     msg.set_content(body)
+
+    ssl_context = ssl.create_default_context()
 
     try:
         if smtp_port == 465:
             # Implicit TLS (SMTPS), used by many hosting providers on port 465
-            smtp_ctx = smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=30)
+            smtp_ctx = smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=30, context=ssl_context)
         else:
             smtp_ctx = smtplib.SMTP(smtp_host, smtp_port, timeout=30)
 
         with smtp_ctx as smtp:
             if smtp_port != 465:
                 try:
-                    smtp.starttls()
+                    smtp.starttls(context=ssl_context)
                 except smtplib.SMTPNotSupportedError:
-                    pass
+                    if smtp_user and smtp_password:
+                        raise MailError(
+                            f"SMTP server {smtp_host}:{smtp_port} does not support STARTTLS - "
+                            "refusing to send login credentials in plaintext"
+                        )
             if smtp_user and smtp_password:
                 smtp.login(smtp_user, smtp_password)
             smtp.send_message(msg)
@@ -357,6 +423,7 @@ def run_job(job: JobConfig) -> bool:
     final_dir = job_base_dir / timestamp
     tmp_log_path = job_base_dir / f"tmp_{timestamp}.log"
     final_log_path = job_base_dir / f"{timestamp}.log"
+    failed_log_path = job_base_dir / f"{timestamp}.failed.log"
 
     try:
         job_base_dir.mkdir(parents=True, exist_ok=True)
@@ -375,7 +442,9 @@ def run_job(job: JobConfig) -> bool:
         ftppasswd = get_ftp_password(job)
         smtp_password = get_smtp_password(job)
 
-        ftp = connect_ftp(job.sourceserver, job.ftpuser, ftppasswd, logger)
+        ftp, used_tls = connect_ftp(
+            job.sourceserver, job.ftpuser, ftppasswd, job.tls, job.tls_ca_file, logger
+        )
         try:
             mirror_ftp(ftp, "/", tmp_dir, logger)
         finally:
@@ -399,13 +468,14 @@ def run_job(job: JobConfig) -> bool:
 
         logger.info("Backup for '%s' completed successfully", job.name)
         if job.notify_on_success:
+            subject_suffix = "" if used_tls else " (UNSICHER: Klartext-FTP, keine Verschluesselung)"
             send_mail(
                 job.smtp_host,
                 job.smtp_port,
                 job.smtp_user,
                 smtp_password,
                 job.admin_mail,
-                f"backupFTP for '{job.name}' ({job.sourceserver}) --> {final_dir} SUCCEEDED",
+                f"backupFTP for '{job.name}' ({job.sourceserver}) --> {final_dir} SUCCEEDED{subject_suffix}",
                 "OK",
             )
         else:
@@ -414,13 +484,39 @@ def run_job(job: JobConfig) -> bool:
 
     except BackupError as exc:
         logger.exception("Backup for '%s' failed: %s", job.name, exc)
+        current_log_path = _cleanup_failed_run(tmp_dir, tmp_log_path, failed_log_path, current_log_path, logger)
         _notify_failure(job, current_log_path, exc, smtp_password, logger)
         return False
 
     except Exception as exc:  # unexpected error - still log and notify cleanly
         logger.exception("Unexpected error for '%s': %s", job.name, exc)
+        current_log_path = _cleanup_failed_run(tmp_dir, tmp_log_path, failed_log_path, current_log_path, logger)
         _notify_failure(job, current_log_path, exc, smtp_password, logger)
         return False
+
+
+def _cleanup_failed_run(
+    tmp_dir: Path,
+    tmp_log_path: Path,
+    failed_log_path: Path,
+    current_log_path: Path,
+    logger: logging.Logger,
+) -> Path:
+    """Removes an incomplete mirror and keeps the log under a .failed.log name."""
+    if tmp_dir.exists():
+        try:
+            shutil.rmtree(tmp_dir)
+        except OSError as exc:
+            logger.error("Could not remove incomplete backup directory %s: %s", tmp_dir, exc)
+
+    if current_log_path == tmp_log_path and tmp_log_path.exists():
+        try:
+            tmp_log_path.rename(failed_log_path)
+            return failed_log_path
+        except OSError as exc:
+            logger.error("Could not rename log %s to %s: %s", tmp_log_path, failed_log_path, exc)
+
+    return current_log_path
 
 
 def _notify_failure(

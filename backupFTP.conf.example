@@ -10,6 +10,13 @@
 [global]
 base_dir = /data/bak
 keep = 7
+; tls = required (default): FTPS with certificate verification, abort if
+;   unavailable. "preferred": try FTPS, fall back to plain FTP if the
+;   server does not support it (logged as a warning, marked as insecure
+;   in the success mail). "off": always use plain FTP.
+tls = required
+; Only needed for servers with a self-signed/private-CA certificate:
+; tls_ca_file = /path/to/ca-bundle.pem
 admin_mail = admin@example.com
 smtp_host = localhost
 smtp_port = 25

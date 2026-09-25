@@ -107,9 +107,20 @@ timezone should be set correctly (`timedatectl status`).
 
 ## Security
 
-- The FTP connection tries FTPS (TLS) first, falling back to plain FTP
-  if unsupported (with a warning logged).
+- FTP connections use FTPS (TLS) with certificate verification by
+  default (`tls = required`). Set `tls = preferred` to fall back to
+  plain FTP when a server does not support FTPS (logged as a warning
+  and marked as insecure in the success mail), or `tls = off` to always
+  use plain FTP. For servers with a self-signed/private-CA certificate,
+  set `tls_ca_file` to a CA bundle instead of disabling verification.
+- SMTP connections use STARTTLS (or implicit TLS on port 465) with
+  certificate verification. If `smtp_user`/`smtp_password` are set but
+  the server does not support STARTTLS, sending is aborted rather than
+  sending the login in plaintext.
 - Passwords should be passed via environment variables (`password_env` /
   `smtp_password_env`) rather than stored in plain text in the config.
 - If passwords are stored directly in the config anyway: restrict file
   permissions to `600`.
+- Filenames reported by the server are validated before being written
+  locally to prevent a compromised/malicious FTP server from writing
+  outside the backup directory (path traversal).
