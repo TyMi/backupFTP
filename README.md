@@ -2,16 +2,19 @@
 
 ![Built with AI](https://img.shields.io/badge/Built_with-AI-success)
 
-Python tool for backing up multiple web spaces via FTP(S). Mirrors each
-configured FTP server recursively into a local directory, keeps the last
+Python tool for backing up multiple web spaces via FTP(S) or SFTP. Mirrors
+each configured server recursively into a local directory, keeps the last
 N generations and sends an email notification about the success or
 failure of each run.
 
 ## Requirements
 
 - Python 3.9 or newer
-- No external packages needed (standard library only: `ftplib`,
-  `smtplib`, `configparser`, `pathlib`, ...)
+- No external packages needed for FTP(S) jobs (standard library only:
+  `ftplib`, `smtplib`, `configparser`, `pathlib`, ...)
+- For SFTP jobs (`protocol = sftp`): the `paramiko` package
+  (`pip install paramiko`). Only imported/required when at least one job
+  actually uses `protocol = sftp`.
 
 ## Setup
 
@@ -65,6 +68,28 @@ plain web space content. Only the last `keep` generations (default: 7),
 including their log, are kept automatically; older ones are removed on
 every successful run.
 
+## SFTP jobs
+
+Set `protocol = sftp` on a job (default: `ftp`) to use SFTP instead of
+FTP(S). Relevant options (global or per job):
+
+- `sftp_port` (default: `22`)
+- `ftpuser` / `password` / `password_env` are reused as the SSH
+  username/password.
+- `ssh_key_file`: path to a private key for key-based auth instead of a
+  password (password fields are ignored if set).
+- `known_hosts_file`: path to an `known_hosts`-format file used, in
+  addition to the system's own known hosts, to verify the server's host
+  key.
+
+The server's host key is **always verified** (against the system's known
+hosts and/or `known_hosts_file`) and the connection is refused if it is
+unknown or does not match - there is no option to disable this, the same
+way FTPS certificate verification cannot be disabled (see Security
+below). Populate the known-hosts entry once beforehand, e.g. with
+`ssh-keyscan -p <sftp_port> <sourceserver> >> known_hosts_file`
+(verify the printed fingerprint out-of-band before trusting it).
+
 ## Email notifications
 
 By default, every run sends an email: on success a short "SUCCEEDED"
@@ -117,6 +142,9 @@ timezone should be set correctly (`timedatectl status`).
   and marked as insecure in the success mail), or `tls = off` to always
   use plain FTP. For servers with a self-signed/private-CA certificate,
   set `tls_ca_file` to a CA bundle instead of disabling verification.
+- SFTP connections (`protocol = sftp`) always verify the server's host
+  key and refuse to connect if it is unknown or does not match - this
+  cannot be disabled, see "SFTP jobs" above.
 - SMTP connections use STARTTLS (or implicit TLS on port 465) with
   certificate verification. If `smtp_user`/`smtp_password` are set but
   the server does not support STARTTLS, sending is aborted rather than

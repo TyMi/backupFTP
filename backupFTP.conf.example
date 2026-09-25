@@ -59,3 +59,17 @@ password_env = FTP_PASSWORD_EXAMPLE2
 ; Example of overriding a global default for just this job:
 ; keep = 14
 ; notify_on_success = false
+
+[example3]
+; SFTP instead of FTP(S) - requires the "paramiko" package.
+name = Example Website 3 (SFTP)
+protocol = sftp
+sourceserver = sftp.example3.com
+; sftp_port = 22
+ftpuser = user3
+password_env = FTP_PASSWORD_EXAMPLE3
+; Key-based auth instead of a password (takes precedence if set):
+; ssh_key_file = /home/backupuser/.ssh/backupFTP_example3
+; The server's host key is always verified, against the system's known
+; hosts and/or this file (see README "SFTP jobs" for how to populate it):
+; known_hosts_file = /home/backupuser/.ssh/backupFTP_known_hosts

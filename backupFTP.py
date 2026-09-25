@@ -20,11 +20,17 @@ import re
 import shutil
 import smtplib
 import ssl
+import stat
 import sys
 from dataclasses import dataclass
 from datetime import datetime
 from email.message import EmailMessage
 from pathlib import Path
+
+try:
+    import paramiko
+except ImportError:
+    paramiko = None  # only required for protocol = sftp
 
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("backupFTP.conf")
 DEFAULT_BASE_DIR = Path("/data/bak")
@@ -37,6 +43,9 @@ VALID_JOB_KEY = re.compile(r"^[a-zA-Z0-9_-]+$")
 DEFAULT_NOTIFY_ON_SUCCESS = True
 VALID_TLS_MODES = ("required", "preferred", "off")
 DEFAULT_TLS_MODE = "required"
+VALID_PROTOCOLS = ("ftp", "sftp")
+DEFAULT_PROTOCOL = "ftp"
+DEFAULT_SFTP_PORT = 22
 
 
 class BackupError(Exception):
@@ -75,8 +84,12 @@ class JobConfig:
     ftpuser: str
     password: str | None
     password_env: str | None
+    protocol: str
     tls: str
     tls_ca_file: str | None
+    sftp_port: int
+    ssh_key_file: str | None
+    known_hosts_file: str | None
     base_dir: Path
     keep: int
     admin_mail: str
@@ -136,6 +149,15 @@ def _validate_tls_mode(section_name: str, value: str) -> str:
     return value
 
 
+def _validate_protocol(section_name: str, value: str) -> str:
+    if value not in VALID_PROTOCOLS:
+        raise ConfigError(
+            f"Job '{section_name}': invalid protocol '{value}', "
+            f"must be one of {', '.join(VALID_PROTOCOLS)}"
+        )
+    return value
+
+
 def _validate_keep(section_name: str, value: int) -> int:
     if value < 1:
         raise ConfigError(
@@ -179,6 +201,10 @@ def load_config(config_path: Path) -> list[JobConfig]:
     )
     global_tls = _validate_tls_mode("global", global_section.get("tls", DEFAULT_TLS_MODE))
     global_tls_ca_file = global_section.get("tls_ca_file")
+    global_protocol = _validate_protocol("global", global_section.get("protocol", DEFAULT_PROTOCOL))
+    global_sftp_port = int(global_section.get("sftp_port", DEFAULT_SFTP_PORT))
+    global_ssh_key_file = global_section.get("ssh_key_file")
+    global_known_hosts_file = global_section.get("known_hosts_file")
 
     jobs: list[JobConfig] = []
     for section_name in parser.sections():
@@ -207,8 +233,12 @@ def load_config(config_path: Path) -> list[JobConfig]:
                 ftpuser=ftpuser,
                 password=section.get("password"),
                 password_env=section.get("password_env"),
+                protocol=_validate_protocol(section_name, section.get("protocol", global_protocol)),
                 tls=_validate_tls_mode(section_name, section.get("tls", global_tls)),
                 tls_ca_file=section.get("tls_ca_file", global_tls_ca_file),
+                sftp_port=int(section.get("sftp_port", global_sftp_port)),
+                ssh_key_file=section.get("ssh_key_file", global_ssh_key_file),
+                known_hosts_file=section.get("known_hosts_file", global_known_hosts_file),
                 base_dir=Path(section.get("base_dir", str(global_base_dir))),
                 keep=_validate_keep(section_name, int(section.get("keep", global_keep))),
                 admin_mail=section.get("admin_mail", global_admin_mail),
@@ -231,7 +261,7 @@ def load_config(config_path: Path) -> list[JobConfig]:
     return jobs
 
 
-def get_ftp_password(job: JobConfig) -> str:
+def get_ftp_password(job: JobConfig) -> str | None:
     if job.password_env:
         password = os.environ.get(job.password_env)
         if password:
@@ -241,6 +271,8 @@ def get_ftp_password(job: JobConfig) -> str:
         )
     if job.password:
         return job.password
+    if job.protocol == "sftp" and job.ssh_key_file:
+        return None
     if not sys.stdin.isatty():
         raise ConfigError(
             f"Job '{job.name}': no password configured (password/password_env) "
@@ -329,6 +361,49 @@ def connect_ftp(
         raise FtpConnectionError(f"Connection to {sourceserver} failed: {exc}") from exc
 
 
+def connect_sftp(
+    sourceserver: str,
+    port: int,
+    ftpuser: str,
+    ftppasswd: str | None,
+    ssh_key_file: str | None,
+    known_hosts_file: str | None,
+    logger: logging.Logger,
+) -> tuple["paramiko.SFTPClient", "paramiko.SSHClient"]:
+    if paramiko is None:
+        raise FtpConnectionError(
+            "protocol=sftp requires the 'paramiko' package, which is not installed "
+            "(pip install paramiko)"
+        )
+
+    client = paramiko.SSHClient()
+    client.load_system_host_keys()
+    if known_hosts_file:
+        try:
+            client.load_host_keys(known_hosts_file)
+        except OSError as exc:
+            raise FtpConnectionError(f"Cannot read known_hosts_file {known_hosts_file}: {exc}") from exc
+    # Never auto-trust an unknown host key (equivalent to certificate
+    # verification for FTPS) - reject instead of silently accepting it.
+    client.set_missing_host_key_policy(paramiko.RejectPolicy())
+
+    try:
+        client.connect(
+            sourceserver,
+            port=port,
+            username=ftpuser,
+            password=None if ssh_key_file else ftppasswd,
+            key_filename=ssh_key_file,
+            timeout=30,
+        )
+        sftp = client.open_sftp()
+        logger.info("Connected via SFTP (host key verified) to %s:%d", sourceserver, port)
+        return sftp, client
+    except (paramiko.SSHException, OSError) as exc:
+        client.close()
+        raise FtpConnectionError(f"SFTP connection to {sourceserver}:{port} failed: {exc}") from exc
+
+
 def mirror_ftp(
     ftp: ftplib.FTP,
     remote_dir: str,
@@ -386,6 +461,53 @@ def mirror_ftp(
             logger.debug("Skipping entry of type %s: %s", entry_type, remote_path)
 
 
+def mirror_sftp(
+    sftp: "paramiko.SFTPClient",
+    remote_dir: str,
+    local_dir: Path,
+    logger: logging.Logger,
+    skipped: list[str],
+) -> None:
+    local_dir.mkdir(parents=True, exist_ok=True)
+    local_dir_resolved = local_dir.resolve()
+
+    try:
+        entries = sftp.listdir_attr(remote_dir)
+    except OSError as exc:
+        raise DownloadError(f"Error listing {remote_dir}: {exc}") from exc
+
+    for attr in entries:
+        name = attr.filename
+        if name in (".", ".."):
+            continue
+        if not name or "/" in name or "\\" in name:
+            logger.warning("Suspicious entry from server skipped: %r", name)
+            continue
+
+        remote_path = f"{remote_dir}/{name}" if remote_dir != "/" else f"/{name}"
+        local_path = (local_dir / name).resolve()
+        if not local_path.is_relative_to(local_dir_resolved):
+            raise DownloadError(f"Path traversal attempt via server filename: {name!r}")
+
+        mode = attr.st_mode or 0
+        if stat.S_ISDIR(mode):
+            logger.debug("Directory: %s", remote_path)
+            mirror_sftp(sftp, remote_path, local_path, logger, skipped)
+        elif stat.S_ISREG(mode):
+            logger.debug("File: %s", remote_path)
+            try:
+                sftp.get(remote_path, str(local_path))
+            except (OSError, paramiko.SSHException) as exc:
+                logger.warning("Skipping unreadable file %s: %s", remote_path, exc)
+                skipped.append(f"{remote_path}: {exc}")
+                try:
+                    local_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        else:
+            logger.debug("Skipping entry of type (mode=%o): %s", mode, remote_path)
+
+
 def dry_run_listing(ftp: ftplib.FTP, remote_dir: str, logger: logging.Logger) -> tuple[int, int, int]:
     """Recursively lists the server like mirror_ftp, but writes nothing locally.
 
@@ -431,6 +553,42 @@ def dry_run_listing(ftp: ftplib.FTP, remote_dir: str, logger: logging.Logger) ->
                 total_bytes += int(facts.get("size", 0))
             except ValueError:
                 logger.debug("No usable size fact for %s", remote_path)
+
+    return file_count, dir_count, total_bytes
+
+
+def dry_run_listing_sftp(
+    sftp: "paramiko.SFTPClient", remote_dir: str, logger: logging.Logger
+) -> tuple[int, int, int]:
+    """Same as dry_run_listing(), but over an already-connected SFTP client."""
+    try:
+        entries = sftp.listdir_attr(remote_dir)
+    except OSError as exc:
+        raise DownloadError(f"Error listing {remote_dir}: {exc}") from exc
+
+    file_count = 0
+    dir_count = 0
+    total_bytes = 0
+
+    for attr in entries:
+        name = attr.filename
+        if name in (".", ".."):
+            continue
+        if not name or "/" in name or "\\" in name:
+            continue
+
+        remote_path = f"{remote_dir}/{name}" if remote_dir != "/" else f"/{name}"
+        mode = attr.st_mode or 0
+
+        if stat.S_ISDIR(mode):
+            dir_count += 1
+            sub_files, sub_dirs, sub_bytes = dry_run_listing_sftp(sftp, remote_path, logger)
+            file_count += sub_files
+            dir_count += sub_dirs
+            total_bytes += sub_bytes
+        elif stat.S_ISREG(mode):
+            file_count += 1
+            total_bytes += attr.st_size or 0
 
     return file_count, dir_count, total_bytes
 
@@ -505,6 +663,47 @@ def send_mail(
         raise MailError(f"Error sending mail via {smtp_host}:{smtp_port}: {exc}") from exc
 
 
+def _connect_and_mirror(
+    job: JobConfig, ftppasswd: str | None, tmp_dir: Path, logger: logging.Logger
+) -> tuple[bool, list[str]]:
+    """Connects via the job's configured protocol and mirrors it into tmp_dir.
+
+    Returns (transport_secure, skipped) - transport_secure is False only for
+    a plain-text FTP fallback (tls=preferred); SFTP is always host-key
+    verified and therefore always reported as secure.
+    """
+    skipped: list[str] = []
+
+    if job.protocol == "sftp":
+        sftp, ssh_client = connect_sftp(
+            job.sourceserver,
+            job.sftp_port,
+            job.ftpuser,
+            ftppasswd,
+            job.ssh_key_file,
+            job.known_hosts_file,
+            logger,
+        )
+        try:
+            mirror_sftp(sftp, "/", tmp_dir, logger, skipped)
+        finally:
+            sftp.close()
+            ssh_client.close()
+        return True, skipped
+
+    ftp, used_tls = connect_ftp(
+        job.sourceserver, job.ftpuser, ftppasswd, job.tls, job.tls_ca_file, logger
+    )
+    try:
+        mirror_ftp(ftp, "/", tmp_dir, logger, skipped)
+    finally:
+        try:
+            ftp.quit()
+        except ftplib.all_errors:
+            ftp.close()
+    return used_tls, skipped
+
+
 def run_job(job: JobConfig) -> bool:
     """Runs a single backup job. Returns True on success."""
 
@@ -533,17 +732,7 @@ def run_job(job: JobConfig) -> bool:
         ftppasswd = get_ftp_password(job)
         smtp_password = get_smtp_password(job)
 
-        ftp, used_tls = connect_ftp(
-            job.sourceserver, job.ftpuser, ftppasswd, job.tls, job.tls_ca_file, logger
-        )
-        skipped: list[str] = []
-        try:
-            mirror_ftp(ftp, "/", tmp_dir, logger, skipped)
-        finally:
-            try:
-                ftp.quit()
-            except ftplib.all_errors:
-                ftp.close()
+        used_tls, skipped = _connect_and_mirror(job, ftppasswd, tmp_dir, logger)
 
         try:
             tmp_dir.rename(final_dir)
@@ -625,16 +814,34 @@ def run_job_dry_run(job: JobConfig) -> bool:
 
     try:
         ftppasswd = get_ftp_password(job)
-        ftp, used_tls = connect_ftp(
-            job.sourceserver, job.ftpuser, ftppasswd, job.tls, job.tls_ca_file, logger
-        )
-        try:
-            file_count, dir_count, total_bytes = dry_run_listing(ftp, "/", logger)
-        finally:
+
+        if job.protocol == "sftp":
+            sftp, ssh_client = connect_sftp(
+                job.sourceserver,
+                job.sftp_port,
+                job.ftpuser,
+                ftppasswd,
+                job.ssh_key_file,
+                job.known_hosts_file,
+                logger,
+            )
             try:
-                ftp.quit()
-            except ftplib.all_errors:
-                ftp.close()
+                file_count, dir_count, total_bytes = dry_run_listing_sftp(sftp, "/", logger)
+            finally:
+                sftp.close()
+                ssh_client.close()
+            used_tls = True
+        else:
+            ftp, used_tls = connect_ftp(
+                job.sourceserver, job.ftpuser, ftppasswd, job.tls, job.tls_ca_file, logger
+            )
+            try:
+                file_count, dir_count, total_bytes = dry_run_listing(ftp, "/", logger)
+            finally:
+                try:
+                    ftp.quit()
+                except ftplib.all_errors:
+                    ftp.close()
 
         logger.info(
             "DRY-RUN for '%s' (%s): %d file(s) in %d director(y/ies), %.1f MiB total "
