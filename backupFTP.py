@@ -48,6 +48,11 @@ VALID_PROTOCOLS = ("ftp", "sftp")
 DEFAULT_PROTOCOL = "ftp"
 DEFAULT_SFTP_PORT = 22
 
+# ftplib.all_errors is itself a tuple; concatenating (rather than nesting it
+# inside another except tuple) keeps the result flat, as required by except.
+FTPS_CONNECT_ERRORS: tuple[type[BaseException], ...] = ftplib.all_errors + (ssl.SSLError, OSError)
+FTP_TRANSFER_ERRORS: tuple[type[BaseException], ...] = ftplib.all_errors + (OSError,)
+
 
 class BackupError(Exception):
     """Base class for all errors during a backup run."""
@@ -384,6 +389,8 @@ def connect_ftp(
 ) -> tuple[ftplib.FTP, bool]:
     """Connects and logs in. Returns (ftp, used_tls)."""
 
+    ftp: ftplib.FTP
+
     if tls_mode in ("required", "preferred"):
         try:
             ctx = ssl.create_default_context(cafile=tls_ca_file) if tls_ca_file else ssl.create_default_context()
@@ -393,7 +400,7 @@ def connect_ftp(
             ftp.prot_p()
             logger.info("Connected via FTPS (TLS, certificate verified) to %s", sourceserver)
             return ftp, True
-        except (*ftplib.all_errors, ssl.SSLError, OSError) as exc:
+        except FTPS_CONNECT_ERRORS as exc:
             if tls_mode == "required":
                 raise FtpConnectionError(
                     f"FTPS (TLS) connection to {sourceserver} failed and tls=required: {exc}"
@@ -423,7 +430,7 @@ def connect_sftp(
     ssh_key_file: str | None,
     known_hosts_file: str | None,
     logger: logging.Logger,
-) -> tuple["paramiko.SFTPClient", "paramiko.SSHClient"]:
+) -> tuple[paramiko.SFTPClient, paramiko.SSHClient]:
     if paramiko is None:
         raise FtpConnectionError(
             "protocol=sftp requires the 'paramiko' package, which is not installed "
@@ -518,7 +525,7 @@ def mirror_ftp(
                             f"size mismatch after download: expected {expected_size} bytes, "
                             f"got {actual_size}"
                         )
-            except (*ftplib.all_errors, OSError) as exc:
+            except FTP_TRANSFER_ERRORS as exc:
                 logger.warning("Skipping unreadable file %s: %s", remote_path, exc)
                 skipped.append(f"{remote_path}: {exc}")
                 try:
@@ -530,7 +537,7 @@ def mirror_ftp(
 
 
 def mirror_sftp(
-    sftp: "paramiko.SFTPClient",
+    sftp: paramiko.SFTPClient,
     remote_dir: str,
     local_dir: Path,
     logger: logging.Logger,
@@ -645,7 +652,7 @@ def dry_run_listing(
 
 
 def dry_run_listing_sftp(
-    sftp: "paramiko.SFTPClient", remote_dir: str, logger: logging.Logger, exclude: list[str]
+    sftp: paramiko.SFTPClient, remote_dir: str, logger: logging.Logger, exclude: list[str]
 ) -> tuple[int, int, int]:
     """Same as dry_run_listing(), but over an already-connected SFTP client."""
     try:
@@ -777,6 +784,7 @@ def send_mail(
     msg.set_content(body)
 
     ssl_context = ssl.create_default_context()
+    smtp_ctx: smtplib.SMTP
 
     try:
         if smtp_port == 465:
@@ -789,12 +797,12 @@ def send_mail(
             if smtp_port != 465:
                 try:
                     smtp.starttls(context=ssl_context)
-                except smtplib.SMTPNotSupportedError:
+                except smtplib.SMTPNotSupportedError as exc:
                     if smtp_user and smtp_password:
                         raise MailError(
                             f"SMTP server {smtp_host}:{smtp_port} does not support STARTTLS - "
                             "refusing to send login credentials in plaintext"
-                        )
+                        ) from exc
             if smtp_user and smtp_password:
                 smtp.login(smtp_user, smtp_password)
             smtp.send_message(msg)
@@ -830,6 +838,10 @@ def _connect_and_mirror(
             ssh_client.close()
         return True, skipped
 
+    # get_ftp_password() only ever returns None for protocol=sftp with a key
+    # file, and that path already returned above - a plain FTP job always has
+    # a password here.
+    assert ftppasswd is not None
     ftp, used_tls = connect_ftp(
         job.sourceserver, job.ftpuser, ftppasswd, job.tls, job.tls_ca_file, logger
     )
@@ -975,6 +987,7 @@ def run_job_dry_run(job: JobConfig) -> bool:
                 ssh_client.close()
             used_tls = True
         else:
+            assert ftppasswd is not None  # only None for protocol=sftp with a key file
             ftp, used_tls = connect_ftp(
                 job.sourceserver, job.ftpuser, ftppasswd, job.tls, job.tls_ca_file, logger
             )

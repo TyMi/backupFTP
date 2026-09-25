@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run shellcheck
+        run: shellcheck backupFTP-cron-daily.sh
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install lint/type-check dependencies
+        run: pip install ruff mypy paramiko
+      - name: Ruff
+        run: ruff check .
+      - name: Mypy
+        run: mypy backupFTP.py --ignore-missing-imports
+
+  smoke-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Compile check
+        run: python -m py_compile backupFTP.py
+
+      - name: CLI smoke test against the shipped example config (no paramiko installed)
+        run: |
+          set -e
+          python backupFTP.py --help
+          cp backupFTP.conf.example backupFTP.conf
+          chmod 600 backupFTP.conf
+          python backupFTP.py --config backupFTP.conf --list-jobs
+          # --job must filter the listing and validate unknown keys
+          test "$(python backupFTP.py --config backupFTP.conf --job example2 --list-jobs)" = \
+            "$(printf 'example2\tExample Website 2\tftp.example2.com')"
+          ! python backupFTP.py --config backupFTP.conf --job doesnotexist --list-jobs
+
+      - name: Config validation smoke test
+        run: |
+          set -e
+          cat > /tmp/bad_keep.conf <<'EOF'
+          [global]
+          base_dir = /tmp/x
+          keep = 0
+          admin_mail = a@example.com
+          [job1]
+          sourceserver = ftp.example.com
+          ftpuser = u
+          password = p
+          EOF
+          ! python backupFTP.py --config /tmp/bad_keep.conf --list-jobs
+
+          cat > /tmp/bad_tls.conf <<'EOF'
+          [global]
+          base_dir = /tmp/x
+          admin_mail = a@example.com
+          [job1]
+          sourceserver = ftp.example.com
+          ftpuser = u
+          password = p
+          tls = bogus
+          EOF
+          ! python backupFTP.py --config /tmp/bad_tls.conf --list-jobs
+
+          ! python backupFTP.py --config /tmp/does-not-exist.conf --list-jobs
+
+      - name: Install paramiko and re-run listing (SFTP job must still load)
+        run: |
+          set -e
+          pip install paramiko
+          python backupFTP.py --config backupFTP.conf --list-jobs
