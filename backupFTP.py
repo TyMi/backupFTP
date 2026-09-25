@@ -339,7 +339,7 @@ def connect_ftp(
             ftp.prot_p()
             logger.info("Connected via FTPS (TLS, certificate verified) to %s", sourceserver)
             return ftp, True
-        except (ftplib.all_errors, ssl.SSLError, OSError) as exc:
+        except (*ftplib.all_errors, ssl.SSLError, OSError) as exc:
             if tls_mode == "required":
                 raise FtpConnectionError(
                     f"FTPS (TLS) connection to {sourceserver} failed and tls=required: {exc}"
@@ -450,7 +450,7 @@ def mirror_ftp(
             try:
                 with open(local_path, "wb") as fh:
                     ftp.retrbinary(f"RETR {name}", fh.write)
-            except (ftplib.all_errors, OSError) as exc:
+            except (*ftplib.all_errors, OSError) as exc:
                 logger.warning("Skipping unreadable file %s: %s", remote_path, exc)
                 skipped.append(f"{remote_path}: {exc}")
                 try:
