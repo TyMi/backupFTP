@@ -136,7 +136,7 @@ FTP(S). Relevant options (global or per job):
   username/password.
 - `ssh_key_file`: path to a private key for key-based auth instead of a
   password (password fields are ignored if set).
-- `known_hosts_file`: path to an `known_hosts`-format file used, in
+- `known_hosts_file`: path to a `known_hosts`-format file used, in
   addition to the system's own known hosts, to verify the server's host
   key.
 
@@ -202,7 +202,17 @@ installed, e.g. via `sudo apt-get install cron`):
    system user `backupFTP.py` should run as) and `BACKUP_DIR` (directory
    containing `backupFTP.py`/`backupFTP.conf`).
 
-2. Install the file into `/etc/cron.daily/` (no dots in the filename,
+2. If any job uses `password_env`/`smtp_password_env` (recommended -
+   see "Setup" above): cron itself only provides a minimal environment,
+   so those variables need to be loaded explicitly. Create
+   `/etc/backupFTP.env` (owner `root`, mode `600`) with one
+   `VARNAME=value` line per variable; the wrapper sources it
+   automatically if present, before switching to `BACKUP_USER`.
+   Without it, jobs relying on `*_password_env` fail under cron with
+   `environment variable ... is not set` even though they work fine
+   when run manually with that variable exported.
+
+3. Install the file into `/etc/cron.daily/` (no dots in the filename,
    otherwise `run-parts` skips it):
 
    ```bash
@@ -211,7 +221,7 @@ installed, e.g. via `sudo apt-get install cron`):
    sudo chmod 755 /etc/cron.daily/backupFTP
    ```
 
-3. Check that `run-parts` picks it up (does not execute it):
+4. Check that `run-parts` picks it up (does not execute it):
 
    ```bash
    sudo run-parts --test /etc/cron.daily
@@ -272,3 +282,7 @@ timezone should be set correctly (`timedatectl status`).
   SSH or an HTTP endpoint before the FTP mirror runs) would close this
   gap, but is postponed for now since there is no current use case for
   it.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

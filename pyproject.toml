@@ -6,5 +6,9 @@ target-version = "py39"
 select = ["E", "F", "W", "UP", "B"]
 
 [tool.mypy]
+# The project itself still supports and is tested on Python 3.9 (see
+# README/ruff target-version/CI matrix) - 3.10 here is only mypy's own
+# minimum supported --python-version floor, not a statement about the
+# project's runtime compatibility.
 python_version = "3.10"
 warn_unused_ignores = true

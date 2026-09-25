@@ -198,8 +198,10 @@ def _is_excluded(rel_path: str, exclude: list[str], is_dir: bool) -> bool:
     return False
 
 
-def _validate_keep(section_name: str, value: int) -> int:
-    if value < 1:
+def _validate_keep(section_name: str, value: int, gfs_active: bool) -> int:
+    # keep is unused (GFS retention takes over entirely) once any of
+    # keep_daily/keep_weekly/keep_monthly is set, so it isn't validated then.
+    if not gfs_active and value < 1:
         raise ConfigError(
             f"Job '{section_name}': invalid keep={value}, must be >= 1 "
             "(keep=0 or negative would delete the backup just created)"
@@ -247,7 +249,6 @@ def load_config(config_path: Path) -> list[JobConfig]:
 
     global_section = parser["global"] if parser.has_section("global") else {}
     global_base_dir = Path(global_section.get("base_dir", str(DEFAULT_BASE_DIR)))
-    global_keep = _validate_keep("global", int(global_section.get("keep", DEFAULT_KEEP_GENERATIONS)))
     global_keep_daily = _validate_gfs_keep(
         "global", "keep_daily", int(global_section.get("keep_daily", 0))
     )
@@ -256,6 +257,10 @@ def load_config(config_path: Path) -> list[JobConfig]:
     )
     global_keep_monthly = _validate_gfs_keep(
         "global", "keep_monthly", int(global_section.get("keep_monthly", 0))
+    )
+    global_gfs_active = bool(global_keep_daily or global_keep_weekly or global_keep_monthly)
+    global_keep = _validate_keep(
+        "global", int(global_section.get("keep", DEFAULT_KEEP_GENERATIONS)), global_gfs_active
     )
     global_admin_mail = global_section.get("admin_mail", DEFAULT_ADMIN_MAIL)
     global_smtp_host = global_section.get("smtp_host", DEFAULT_SMTP_HOST)
@@ -300,6 +305,17 @@ def load_config(config_path: Path) -> list[JobConfig]:
         except KeyError as exc:
             raise ConfigError(f"Job '{section_name}': required field {exc} missing in config") from exc
 
+        keep_daily = _validate_gfs_keep(
+            section_name, "keep_daily", int(section.get("keep_daily", global_keep_daily))
+        )
+        keep_weekly = _validate_gfs_keep(
+            section_name, "keep_weekly", int(section.get("keep_weekly", global_keep_weekly))
+        )
+        keep_monthly = _validate_gfs_keep(
+            section_name, "keep_monthly", int(section.get("keep_monthly", global_keep_monthly))
+        )
+        gfs_active = bool(keep_daily or keep_weekly or keep_monthly)
+
         jobs.append(
             JobConfig(
                 key=section_name,
@@ -323,16 +339,10 @@ def load_config(config_path: Path) -> list[JobConfig]:
                     section.get("check_disk_space"), global_check_disk_space
                 ),
                 base_dir=Path(section.get("base_dir", str(global_base_dir))),
-                keep=_validate_keep(section_name, int(section.get("keep", global_keep))),
-                keep_daily=_validate_gfs_keep(
-                    section_name, "keep_daily", int(section.get("keep_daily", global_keep_daily))
-                ),
-                keep_weekly=_validate_gfs_keep(
-                    section_name, "keep_weekly", int(section.get("keep_weekly", global_keep_weekly))
-                ),
-                keep_monthly=_validate_gfs_keep(
-                    section_name, "keep_monthly", int(section.get("keep_monthly", global_keep_monthly))
-                ),
+                keep=_validate_keep(section_name, int(section.get("keep", global_keep)), gfs_active),
+                keep_daily=keep_daily,
+                keep_weekly=keep_weekly,
+                keep_monthly=keep_monthly,
                 admin_mail=section.get("admin_mail", global_admin_mail),
                 smtp_host=section.get("smtp_host", global_smtp_host),
                 smtp_port=int(section.get("smtp_port", global_smtp_port)),
@@ -902,6 +912,13 @@ def rotate_backups(
             old_log = base_dir / f"{old_dir.name}.log"
             if old_log.exists():
                 old_log.unlink()
+
+        # .failed.log files from failed runs aren't generations and are
+        # never covered by the cleanup above - cap how many accumulate.
+        failed_logs = sorted(base_dir.glob("*.failed.log"), key=lambda p: p.name)
+        for old_failed_log in failed_logs[: -max(keep, 1)]:
+            logger.info("Removing old failed-run log %s", old_failed_log)
+            old_failed_log.unlink()
     except OSError as exc:
         raise RotationError(f"Error cleaning up old generations in {base_dir}: {exc}") from exc
     except ValueError as exc:
@@ -1134,20 +1151,20 @@ def run_job(job: JobConfig) -> bool:
         if job.notify_on_success:
             notes = []
             if not used_tls:
-                notes.append("UNSICHER: Klartext-FTP, keine Verschluesselung")
+                notes.append("INSECURE: plain-text FTP, no encryption")
             if skipped:
-                notes.append(f"Teilerfolg: {len(skipped)} Datei(en) uebersprungen")
+                notes.append(f"partial success: {len(skipped)} file(s) skipped")
             subject_suffix = f" ({', '.join(notes)})" if notes else ""
             body = (
                 f"OK\n\n"
-                f"Dateien: {stats['files']} (davon {stats['hardlinked']} unveraendert "
-                f"aus der Vorgaenger-Generation uebernommen)\n"
-                f"Groesse: {stats['bytes'] / (1024 * 1024):.1f} MiB\n"
-                f"Dauer: {duration:.1f} s\n"
-                f"TLS/Host-Key verifiziert: {'ja' if used_tls else 'NEIN'}"
+                f"Files: {stats['files']} ({stats['hardlinked']} unchanged, "
+                f"reused from the previous generation)\n"
+                f"Size: {stats['bytes'] / (1024 * 1024):.1f} MiB\n"
+                f"Duration: {duration:.1f} s\n"
+                f"TLS/host key verified: {'yes' if used_tls else 'NO'}"
             )
             if skipped:
-                body += "\n\nFolgende Dateien konnten nicht gesichert werden:\n" + "\n".join(skipped)
+                body += "\n\nThe following files could not be backed up:\n" + "\n".join(skipped)
             send_mail(
                 job.smtp_host,
                 job.smtp_port,
