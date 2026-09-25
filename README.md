@@ -1,6 +1,7 @@
 # backupFTP
 
 ![Built with AI](https://img.shields.io/badge/Built_with-AI-success)
+[![CI](https://github.com/TyMi/backupFTP/actions/workflows/ci.yml/badge.svg)](https://github.com/TyMi/backupFTP/actions/workflows/ci.yml)
 
 Python tool for backing up multiple web spaces via FTP(S) or SFTP. Mirrors
 each configured server recursively into a local directory, keeps the last
