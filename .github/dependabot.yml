@@ -1,0 +1,10 @@
+# Keeps the GitHub Actions used in .github/workflows/ up to date.
+# Free for public repositories; opens a pull request when an action has a new release.
+# (No pip ecosystem: the project declares no pinned runtime dependencies;
+# paramiko is optional and installed unpinned in CI.)
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
