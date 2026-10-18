@@ -110,3 +110,32 @@ jobs:
         run: pip install pytest pyftpdlib paramiko
       - name: Run integration tests against real local FTP/SFTP servers
         run: pytest -v
+
+  pip-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Audits the only third-party runtime dependency (optional SFTP
+      # support) against known CVEs.
+      - name: pip-audit
+        run: |
+          pip install pip-audit
+          echo paramiko > /tmp/audit-requirements.txt
+          pip-audit -r /tmp/audit-requirements.txt
+
+  codeql:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: python
+      - uses: github/codeql-action/analyze@v4
